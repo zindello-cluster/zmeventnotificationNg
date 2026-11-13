@@ -6,7 +6,12 @@
 #     /usr/share/perl5/ZmEventNotification;
 #   - ZoneMinder starts as that user (PUID, PGID: its start re-owns the image's files, and must
 #     leave the read-only ones alone);
-#   - the event server is running, at this branch's release, listening, with no error in its log.
+#   - the event server is running, at this branch's release, listening, with no error in its log,
+#     and with the alert rules off, as they are unless its config turns them on;
+#   - with the rules turned on and the tables there (alert-rules/t/schema.sql): a pretend phone
+#     (tests/phone.py) signs in as a ZoneMinder user and registers, and is listed in alert_phones
+#     under that user, by its token's hash; Remove on that row takes it out of the token file
+#     and off the list.
 #
 #   alert-rules/tests/smoke.sh <zoneminder image> <event server image>
 set -eu
@@ -83,6 +88,68 @@ wait_log() { # <pattern> <what>
 wait_log "Event Notification daemon v $version starting" "the event server started, at $version"
 wait_log "Web Socket Event Server listening on port 9000" "it listens for the app"
 in_zm pgrep -f /usr/bin/zmeventnotification.pl >/dev/null || fail "the event server isn't running"
-if in_zm grep -E '\.(ERR|FAT|PNC) ' "$log"; then fail "errors in the event server's log"; fi
+no_errors() {
+  if in_zm grep -E '\.(ERR|FAT|PNC) ' "$log"; then fail "errors in the event server's log"; fi
+}
+no_errors
+if in_zm grep -q 'Alert rules' "$log"; then fail "the alert rules ran without being turned on"; fi
+echo "ok: nothing but information in its log, and nothing from the alert rules: they're off"
+
+# The rules on, as the chart turns them on: the tables beside ZoneMinder's, in a database its own
+# user can use, and our section in the event server's config.
+sql -e "CREATE DATABASE detector; GRANT ALL ON detector.* TO 'zmuser'@'%';"
+sql detector < alert-rules/t/schema.sql
+docker exec -i --user 0 es-smoke sh -c 'cat >> /config/es/zmeventnotification.yml' <<'YAML'
+
+alert_rules:
+  enable: "yes"
+  database: detector
+YAML
+in_zm sh -c ": > $log"
+in_zm zmdc.pl restart zmeventnotification.pl >/dev/null
+wait_log "Alert rules are on, kept in the detector database" "restarted with the alert rules on"
+wait_log "Web Socket Event Server listening on port 9000" "it listens for the app"
+
+# Is that phone listed, under that user? (The first update is at the event server's start, the
+# next ones every 30 seconds.)
+token="smoke-test-token-$$-0123456789abcdef"
+hash=$(printf '%s' "$token" | sha256sum | cut -d' ' -f1)
+listed() { sql -N -e "SELECT COALESCE(username, '') FROM detector.alert_phones WHERE token_hash = '$hash' AND \`remove\` = 0"; }
+in_file() { in_zm grep -q -- "$token" /config/es/push/tokens.txt; }
+wait_for() { # <what> <command...>
+  what=$1; shift
+  for i in $(seq 40); do
+    if "$@"; then echo "ok: $what"; return; fi
+    sleep 2
+  done
+  fail "$what"
+}
+
+# A fresh ZoneMinder's own user. Its sign-in is checked against ZoneMinder's users.
+docker exec -i es-smoke python3 - admin admin "$token" < alert-rules/tests/phone.py || fail "the pretend phone couldn't sign in and register"
+in_file || fail "the phone's token isn't in the token file"
+in_zm python3 -c '
+import json, sys
+phone = json.load(open("/config/es/push/tokens.txt"))["tokens"][sys.argv[1]]
+assert phone.get("user") == "admin", phone.get("user")
+assert phone.get("paired") and phone.get("seen"), sorted(phone)
+' "$token" || fail "the token file doesn't have the phone's user and when it paired"
+echo "ok: the token file keeps the phone's user and when it paired"
+is_admins() { [ "$(listed)" = admin ]; }
+wait_for "the phone is listed under the user who signed in on it, by its token's hash" is_admins
+[ "$(sql -N -e "SELECT COUNT(*) FROM detector.alert_phones")" = 1 ] || fail "more than the one phone is listed"
+
+if docker exec -i es-smoke python3 - admin not-the-password "$token-2" < alert-rules/tests/phone.py >/dev/null 2>&1; then
+  fail "a wrong password signed in"
+fi
+echo "ok: a wrong password doesn't sign in"
+
+# Remove, as the page and the API do it.
+sql -e "UPDATE detector.alert_phones SET \`remove\` = 1 WHERE token_hash = '$hash'"
+gone() { [ "$(sql -N -e "SELECT COUNT(*) FROM detector.alert_phones")" = 0 ] && ! in_file; }
+wait_for "Remove takes the phone out of the token file and off the list" gone
+in_zm grep -q "Alert rules: admin's phone was removed" "$log" || fail "the removal isn't in the log"
+in_zm pgrep -f /usr/bin/zmeventnotification.pl >/dev/null || fail "the event server isn't running"
+no_errors
 echo "ok: nothing but information in its log"
 echo "smoke test passed"
