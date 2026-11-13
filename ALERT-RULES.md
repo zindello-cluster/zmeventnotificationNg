@@ -12,8 +12,31 @@ carry.
 
 ## Our commits
 
-None yet: this is the build. The rules go in by their own pull requests, each change marked
-`zindello-cluster` in a comment where it sits, and are listed here.
+One new module, and a few lines where upstream's code calls it, each marked `zindello-cluster` in
+a comment where it sits, so a new upstream release merges cleanly:
+
+1. **The alert rules** (`ZmEventNotification/AlertRules.pm`, new). Reads the rules and decides:
+   all of the user's alerts off, no push; the user's row for the camera, else the default row,
+   and its switch off, no push; otherwise a push if one of the types the hook found is in the
+   row. And it keeps the list of paired phones the page shows (`alert_phones`: a hash of each
+   token, never the token), and forgets a phone the page or the API marked for Remove. Off unless
+   the event server's config turns it on:
+   ```yaml
+   alert_rules:
+     enable: "yes"
+     database: detector
+   ```
+   With it off nothing of ours runs. If the rules can't be read an alert is sent as it was before
+   them, and the log says so.
+2. **The sign-in keeps the user** (`WebSocketHandler.pm`). Upstream checks the user and password
+   and forgets them; ours keeps the name on the connection, only when it was checked against
+   ZoneMinder's users, and hands it on when the phone registers its token.
+3. **The token file keeps the user** (`FCM.pm`), with when the phone paired and last registered,
+   and it's read back at start. Upstream's own calls write what they always did.
+4. **`sendEvent` asks the rules** (`HookProcessor.pm`) before it sends or claims the interval, for
+   pushes and the app's open connection, at the start and the end of an event. MQTT is untouched.
+5. **The parent's tick** (`zmeventnotification.pl`) brings the list of phones up to date every 30
+   seconds, and notes each push a fork reports for "last alert".
 
 `git log $(cat alert-rules/UPSTREAM_RELEASE)..alert-rules -- zmeventnotification.pl ZmEventNotification`
 lists them.
@@ -27,8 +50,8 @@ lists them.
   hook scripts and pyzm.
 - **`master`:** upstream's, only ever synced from upstream. Nothing of ours is merged to it.
 
-Upstream's own workflows are deleted on `alert-rules` and switched off in the fork's settings;
-ours are `.github/workflows/alert-rules-*`.
+Upstream's own workflows are deleted on `alert-rules`, and GitHub never registered them in the
+fork, so there was nothing to switch off; ours are `.github/workflows/alert-rules-*`.
 
 ## The image
 
@@ -44,12 +67,15 @@ Before building, CI:
   an image that changed it, or carries another release, fails the build rather than being
   overwritten (`tests/check-files.sh`);
 - runs the event server's tests inside the ZoneMinder image, whose Perl is the one it runs with:
-  upstream's, unchanged, then ours in `alert-rules/t/` (`tests/perl.sh`).
+  upstream's, unchanged and with nothing reaching the network, then ours in `alert-rules/t/`
+  against a throwaway MariaDB: each line of the rule, the token file, the sign-in, the list of
+  phones and Remove (`tests/perl.sh`). `alert-rules/t/schema.sql` is a copy of the chart's tables.
 
 After building, it lays the image over the ZoneMinder image as the chart does and starts
-ZoneMinder against a throwaway MariaDB: the event server must be running, at our release, with no
-error in its log (`tests/smoke.sh`). A pull request into the branch runs the same, without
-pushing.
+ZoneMinder against a throwaway MariaDB (`tests/smoke.sh`): the event server must be running, at
+our release, with no error in its log and the rules off; then, with the rules on, a pretend phone
+(`tests/phone.py`) signs in and registers, is listed under its user, and Remove forgets it. A
+pull request into the branch runs the same, without pushing.
 
 The digest is in the run's summary. `external-security.zindello.com.au` pins it; a pull request
 there moves it, and merging and syncing that is the deploy. The image is private on GHCR.

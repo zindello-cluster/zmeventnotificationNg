@@ -68,6 +68,7 @@ use ZmEventNotification::Connection qw(:all);
 use ZmEventNotification::Rules qw(:all);
 use ZmEventNotification::WebSocketHandler qw(:all);
 use ZmEventNotification::HookProcessor qw(:all);
+use ZmEventNotification::AlertRules;    # zindello-cluster: alert rules (ALERT-RULES.md)
 
 use ZoneMinder;
 use version;
@@ -592,6 +593,8 @@ sub processJobs {
       } elsif ( $job eq 'fcm_notification' ) {
         # Update badge count of active connection
         my ( $token, $badge, $count, $at, $eid ) = @fields;
+        # zindello-cluster: alert rules: when each phone was last sent an alert
+        ZmEventNotification::AlertRules::pushed($token) if defined &ZmEventNotification::AlertRules::pushed;
         Debug(2, "GOT JOB==> update badge to $badge, count to $count for: $token, at: $at");
         foreach (@active_connections) {
           next unless defined $_->{token};
@@ -757,6 +760,9 @@ sub initSocketServer {
 
       checkConnection();
       processJobs();
+      # zindello-cluster: alert rules: a removed phone forgotten, the list of
+      # paired phones kept (ALERT-RULES.md)
+      ZmEventNotification::AlertRules::tick();
 
       Debug(2, "There are $child_forks active child forks & $parallel_hooks zm_detect processes running...");
       my @newEvents = checkNewEvents();
