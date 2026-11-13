@@ -1,0 +1,47 @@
+# Each morning, checks for a new upstream event server release. If there's one this branch hasn't
+# merged (alert-rules/UPSTREAM_RELEASE), it opens an issue saying so, once per release. Merging
+# it is a pull request made with alert-rules/sync.sh, which the owner approves (ALERT-RULES.md);
+# nothing here changes the code.
+name: upstream
+
+on:
+  schedule:
+    - cron: '0 21 * * *'   # 07:00 or 08:00 in Sydney
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: New upstream release?
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM: ZoneMinder/zmeventnotificationNg
+        run: |
+          set -eu
+          ours=$(cat alert-rules/UPSTREAM_RELEASE)
+          latest=$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name)
+          echo "ours $ours, upstream's latest $latest"
+          [ "$latest" = "$ours" ] && exit 0
+          newest=$(printf '%s\n%s\n' "$ours" "$latest" | sort -V | tail -1)
+          [ "$newest" = "$latest" ] || { echo "upstream's latest is older than ours"; exit 0; }
+          title="Upstream zmeventnotificationNg $latest"
+          if [ -n "$(gh issue list --state all --search "\"$title\" in:title" --json number --jq '.[].number')" ]; then
+            echo "already raised"; exit 0
+          fi
+          {
+            echo "Upstream released [$latest](https://github.com/$UPSTREAM/releases/tag/$latest); \`alert-rules\` is on $ours, the release the ZoneMinder image carries (\`alert-rules/ZONEMINDER_IMAGE\`)."
+            echo
+            echo "1. Read its release notes. Does upstream now keep each phone against its user and decide pushes per user (ALERT-RULES.md)? Then the fork has done its job: retire it."
+            echo "2. Otherwise this waits for the ZoneMinder image: the event server's files must match the rest of what that image holds. When zindello-cluster/zoneminder moves to a team image with this release, sync \`master\`, run \`alert-rules/sync.sh $latest <that image by digest>\`, push \`upstream-$latest\` and open a pull request into \`alert-rules\` with the release notes, risks and rollback."
+            echo "3. Once that's merged and built, one pull request in external-security.zindello.com.au moves both digests, ZoneMinder's and the event server's, together."
+          } > "$RUNNER_TEMP/body.md"
+          gh issue create --title "$title" --body-file "$RUNNER_TEMP/body.md"

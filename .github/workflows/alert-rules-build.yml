@@ -1,0 +1,109 @@
+# Our image, from our branch (ALERT-RULES.md; cluster-docs O431, K89). On each merge to
+# alert-rules: the ZoneMinder image's event server is checked against upstream's at our release,
+# the event server's tests are run inside that image, our files are built into an image, that is
+# laid over the ZoneMinder image and started against a throwaway MariaDB, and it's pushed to GHCR
+# as ghcr.io/zindello-cluster/zmeventnotificationng:<release>, its digest in the run's summary for
+# the chart. On a pull request into alert-rules: the same, without the push. Upstream's own
+# workflows are deleted on this branch; only the alert-rules-* ones run.
+name: build
+
+on:
+  push:
+    branches: [alert-rules]
+  pull_request:
+    branches: [alert-rules]
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: The release, and the ZoneMinder image it's checked against
+        id: release
+        run: |
+          set -euo pipefail
+          release=$(cat alert-rules/UPSTREAM_RELEASE)
+          version=${release#v}
+          test "$version" = "$(tr -d '[:space:]' < VERSION)" || { echo "::error::UPSTREAM_RELEASE is $release but VERSION is $(cat VERSION)" >&2; exit 1; }
+          zm=$(cat alert-rules/ZONEMINDER_IMAGE)
+          echo "$zm" | grep -Eq '^ghcr\.io/zoneminder/zoneminder:[^@]+@sha256:[0-9a-f]{64}$' \
+            || { echo "::error::alert-rules/ZONEMINDER_IMAGE: expected ghcr.io/zoneminder/zoneminder:<release>-es@sha256:…" >&2; exit 1; }
+          {
+            echo "release=$release"
+            echo "zm=$zm"
+            echo "image=ghcr.io/$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]'):$version"
+          } >> "$GITHUB_OUTPUT"
+          echo "the event server $release, against $zm"
+
+      - name: Fetch upstream's tag
+        env:
+          RELEASE: ${{ steps.release.outputs.release }}
+        run: git fetch -q https://github.com/ZoneMinder/zmeventnotificationNg.git "refs/tags/$RELEASE:refs/tags/$RELEASE"
+
+      - name: The ZoneMinder image's event server is upstream's at our release
+        env:
+          RELEASE: ${{ steps.release.outputs.release }}
+          ZM: ${{ steps.release.outputs.zm }}
+        run: |
+          docker pull -q "$ZM"
+          sh alert-rules/tests/check-files.sh "$RELEASE" "$ZM"
+
+      - name: The event server's tests, inside the ZoneMinder image
+        env:
+          ZM: ${{ steps.release.outputs.zm }}
+        run: sh alert-rules/tests/perl.sh "$ZM"
+
+      - name: Build the image
+        env:
+          IMAGE: ${{ steps.release.outputs.image }}
+        run: |
+          sh alert-rules/export.sh alert-rules/files
+          docker build -t "$IMAGE" \
+            --label "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}" \
+            --label "org.opencontainers.image.revision=${{ github.sha }}" alert-rules
+
+      - name: Lay it over the ZoneMinder image and start it against a throwaway MariaDB
+        env:
+          IMAGE: ${{ steps.release.outputs.image }}
+          ZM: ${{ steps.release.outputs.zm }}
+        run: sh alert-rules/tests/smoke.sh "$ZM" "$IMAGE"
+
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6  # v4.7.0
+        if: github.event_name == 'push'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push
+        if: github.event_name == 'push'
+        env:
+          IMAGE: ${{ steps.release.outputs.image }}
+        run: |
+          set -euo pipefail
+          docker push -q "$IMAGE"
+          digest=$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE" | sed 's/.*@//')
+          {
+            echo "## $IMAGE"
+            echo
+            echo "Built from \`alert-rules\` at ${{ github.sha }}. Digest: \`$digest\`"
+            echo
+            echo "For the chart (external-security.zindello.com.au, deploy/values.yaml, eventServer.image:):"
+            echo '```yaml'
+            echo "repository: ${IMAGE%:*}"
+            echo "tag: \"${IMAGE##*:}\""
+            echo "digest: $digest"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
