@@ -14,6 +14,7 @@ use ZmEventNotification::MQTT qw(sendOverMQTTBroker);
 use ZmEventNotification::Rules qw(isAllowedInRules);
 use ZmEventNotification::DB qw(updateEventinZmDB getNotesFromEventDB tagEventObjects);
 use ZmEventNotification::WebSocketHandler qw(getNotificationStatusEsControl);
+use ZmEventNotification::AlertRules;    # zindello-cluster: alert rules (ALERT-RULES.md)
 
 our @EXPORT_OK = qw(
   processNewAlarmsInFork
@@ -145,6 +146,10 @@ sub sendEvent {
   }
 
   return unless $send;
+
+  # zindello-cluster: alert rules (ALERT-RULES.md). Asked before the interval
+  # is claimed, so an alert the rules refuse doesn't count against it.
+  return unless ZmEventNotification::AlertRules::allows( $alarm, $ac );
 
   # The interval applies to start notifications only. It is checked again
   # here, under the lock, because another fork may have sent since

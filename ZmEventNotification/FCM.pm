@@ -578,12 +578,17 @@ sub initFCMTokens {
       appversion   => $appversion,
       invocations  => $invocations,
       profile      => $profile,
+      user         => $token_data->{user},    # zindello-cluster: alert rules
       };
   } # end foreach token
 }
 
 sub saveFCMTokens {
   return if !$fcm_config{enabled};
+  # zindello-cluster: alert rules (ALERT-RULES.md). A caller that hands on
+  # the connection's user, the ninth argument, even an undefined one, also
+  # gets when the phone paired and last registered kept in the token file.
+  my $with_user = @_ > 8;
   my $stoken     = shift;
   my $smonlist   = shift;
   my $sintlist   = shift;
@@ -592,6 +597,7 @@ sub saveFCMTokens {
   my $invocations = shift;
   my $appversion = shift || 'unknown';
   my $sprofile   = shift;
+  my $suser      = shift;    # zindello-cluster: alert rules
 
   $invocations = {count=>0, at=>(localtime)[4]} if !defined($invocations);
 
@@ -610,6 +616,14 @@ sub saveFCMTokens {
   my $lock = _lockTokenFile();
   my $tokens_data = readTokenFile();
   return if !$tokens_data;
+
+  # zindello-cluster: alert rules. The user is never cleared here; a phone
+  # already in the file from before the rules has no time it paired.
+  if ($with_user) {
+    $tokens_data->{tokens}->{$stoken}->{paired} = time() if !exists $tokens_data->{tokens}->{$stoken};
+    $tokens_data->{tokens}->{$stoken}->{seen} = time();
+    $tokens_data->{tokens}->{$stoken}->{user} = $suser if defined $suser && $suser ne '';
+  }
 
   $tokens_data->{tokens}->{$stoken}->{monlist} = $smonlist if $smonlist ne '-1';
   $tokens_data->{tokens}->{$stoken}->{intlist} = $sintlist if $sintlist ne '-1';

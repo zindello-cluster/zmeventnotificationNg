@@ -398,7 +398,7 @@ sub processIncomingMessage {
             my ( $emonlist, $eintlist ) = saveFCMTokens(
               $_->{token},    $_->{monlist}, $_->{intlist},
               $_->{platform}, $_->{pushstate}, $_->{invocations}, $_->{appversion},
-              $_->{profile}
+              $_->{profile}, $_->{user}    # zindello-cluster: alert rules
             );
             $_->{monlist} = $emonlist;
             $_->{intlist} = $eintlist;
@@ -435,7 +435,7 @@ sub processIncomingMessage {
           my ( $emonlist, $eintlist ) = saveFCMTokens(
             $_->{token},    $_->{monlist}, $_->{intlist},
             $_->{platform}, $_->{pushstate}, $_->{invocations}, $_->{appversion},
-            $_->{profile}
+            $_->{profile}, $_->{user}    # zindello-cluster: alert rules
           );
           $_->{monlist} = $emonlist;
           $_->{intlist} = $eintlist;
@@ -487,7 +487,7 @@ sub processIncomingMessage {
           saveFCMTokens(
             $_->{token},    $_->{monlist}, $_->{intlist},
             $_->{platform}, $_->{pushstate}, $_->{invocations}, $_->{appversion},
-            $_->{profile}
+            $_->{profile}, $_->{user}    # zindello-cluster: alert rules
           );
         }
       } # end foreach active_connections
@@ -555,6 +555,14 @@ sub processIncomingMessage {
           $_->{monlist}    = $monlist;
           $_->{intlist}    = $intlist;
           $_->{token}      = '';
+          # zindello-cluster: alert rules need whose phone this is
+          # (ALERT-RULES.md). Only a name validateAuth has checked against
+          # ZoneMinder's users is kept.
+          if ( $auth_config{enabled} && $category eq 'normal' ) {
+            $_->{user} = $uname;
+          } else {
+            delete $_->{user};
+          }
           my $str = encode_json(
             { event   => 'auth',
               type    => '',
