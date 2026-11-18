@@ -12,6 +12,22 @@ package ZmEventNotification::AlertRules;
 #     enable: "yes"        # off unless set: with it off nothing here runs
 #     database: detector   # where the alert_rules, alert_users and
 #                          # alert_phones tables are
+#     follow: "yes"        # off unless set: while an event is on, push the
+#                          # moment a type joins its alarm (below)
+#     follow_seconds: 1    # how often a running event is looked at
+#     pictures: /run/live-pictures  # where live detection leaves the frame
+#                          # each type first alarmed on, its boxes drawn;
+#                          # unset, no pictures
+#
+# Following an event (the owner, 18 November 2026: "If a current event is
+# firing, and a category we notify about shows up, it should be immediate.";
+# cluster-docs O477). Live detection writes each type that raises or holds a
+# camera's alarm to detector_alarms, in the same database. While an event is
+# on, its fork asks here every follow_seconds which types have alarmed on its
+# camera since it started; a type not yet told of in this event is sent on its
+# own, through sendEvent and so through the rules, once per event. The frame
+# it first alarmed on becomes the event's objdetect.jpg, if the event has none
+# yet (the owner: "Let's go with C."; cluster-docs O478).
 #
 # It uses the event server's own database connection, ZoneMinder's. Nothing
 # here may stop a push or the daemon: if the rules can't be read the alert is
@@ -33,31 +49,44 @@ use constant CACHE_SECONDS => 10;    # how long a rule that was read is used
 
 my $settings;
 my %cache;
+my %event_start;    # event id -> its start, seconds since the epoch
 my %pushed;
 my $last_tick = 0;
 
 sub _settings {
   return $settings if $settings;
-  my ( $on, $db ) = ( 0, 'detector' );
+  my ( $on, $db, $follow, $every, $pictures ) = ( 0, 'detector', 0, 1, undef );
   if ($config_obj) {
-    $on = config_get_val( $config_obj, 'alert_rules', 'enable', 'no' ) ? 1 : 0;
-    $db = config_get_val( $config_obj, 'alert_rules', 'database', 'detector' );
+    $on     = config_get_val( $config_obj, 'alert_rules', 'enable', 'no' ) ? 1 : 0;
+    $db     = config_get_val( $config_obj, 'alert_rules', 'database', 'detector' );
+    $follow = config_get_val( $config_obj, 'alert_rules', 'follow', 'no' ) ? 1 : 0;
+    $every  = config_get_val( $config_obj, 'alert_rules', 'follow_seconds', 1 );
+    $pictures = config_get_val( $config_obj, 'alert_rules', 'pictures', undef );
+  }
+  if ( !defined $every || $every !~ /^[1-9]\d*$/ ) {
+    main::Error("Alert rules: follow_seconds must be a whole number of seconds, 1 or more; 1 it is");
+    $every = 1;
   }
   if ( $on && $db !~ /^\w+$/ ) {
     main::Error("Alert rules: '$db' isn't a database's name, so the rules are off");
     $on = 0;
   }
-  main::Info("Alert rules are on, kept in the $db database") if $on;
-  return $settings = { on => $on, db => $db };
+  main::Info( "Alert rules are on, kept in the $db database" . ( $follow ? ", following each event every $every s" : '' ) ) if $on;
+  return $settings = { on => $on, db => $db, follow => $on && $follow, every => $every, pictures => $pictures };
 }
 
 sub enabled { return _settings()->{on}; }
 
+# Whether a running event is followed, and how often, in whole seconds.
+sub following      { return _settings()->{follow}; }
+sub follow_seconds { return _settings()->{every}; }
+
 # For tests: forget the settings and everything remembered.
 sub _reset {
   $settings  = undef;
-  %cache     = ();
-  %pushed    = ();
+  %cache       = ();
+  %pushed      = ();
+  %event_start = ();
   $last_tick = 0;
 }
 
@@ -188,6 +217,91 @@ sub allows {
   my $camera = defined $alarm->{Name} && $alarm->{Name} ne '' ? $alarm->{Name} : 'camera ' . ( $alarm->{MonitorId} // '?' );
   main::Info("Alert rules: no alert to $who for $camera: $why");
   return 0;
+}
+
+# The types that raised or held live detection's alarm on the camera since the
+# event started: { label => { confidence, picture } }, the picture the frame it
+# first alarmed on, if live detection kept one. Dies if they can't be read.
+sub alarmed {
+  my ( $eid, $mid ) = @_;
+  my $db = _settings()->{db};
+  if ( !defined $event_start{$eid} ) {
+    # ZoneMinder writes the start in its own zone, which its connection has
+    my $rows = _rows( 'SELECT UNIX_TIMESTAMP(StartDateTime) AS t FROM Events WHERE Id = ?', $eid );
+    die "no event $eid\n" if !@$rows || !defined $rows->[0]{t};
+    $event_start{$eid} = $rows->[0]{t};
+  }
+  my $t    = $event_start{$eid};
+  my $s    = int($t);
+  my $from = strftime( '%Y-%m-%d %H:%M:%S', gmtime($s) ) . sprintf( '.%06d', int( ( $t - $s ) * 1e6 + 0.5 ) % 1000000 );
+  my $rows = _rows(
+    "SELECT label, MAX(best_confidence) AS confidence,"
+      . " SUBSTRING_INDEX(GROUP_CONCAT(picture ORDER BY raised_at, first_seen SEPARATOR '\\n'), '\\n', 1) AS picture"
+      . " FROM `$db`.detector_alarms"
+      . ' WHERE monitor_id = ? AND last_seen >= ? GROUP BY label',
+    $mid, $from
+  );
+  my %found;
+  foreach (@$rows) {
+    ( my $label = lc( $_->{label} // '' ) ) =~ s/^\s+|\s+$//g;
+    $label = 'motorcycle' if $label eq 'motorbike';
+    $found{$label} = { confidence => $_->{confidence}, picture => $_->{picture} } if $label ne '';
+  }
+  return \%found;
+}
+
+# What has joined the event's alarm since this was last asked: (its text, as
+# the hook's, its detections, with only those types, and the picture of the
+# first of them), or () when nothing new has. $told holds the types already told of in this event, and is kept
+# up to date. A failed read is logged once for the event, and tried again.
+sub joined {
+  my ( $eid, $mid, $told ) = @_;
+  my $now = eval { alarmed( $eid, $mid ) };
+  if ( !$now ) {
+    ( my $err = $@ // '' ) =~ s/\s+$//;
+    main::Error("Alert rules: what has alarmed in event $eid couldn't be read, trying again: $err") if !$told->{"\0failed"}++;
+    return;
+  }
+  my @new = sort { $now->{$b}{confidence} <=> $now->{$a}{confidence} || $a cmp $b } grep { !$told->{$_} } keys %$now;
+  return if !@new;
+  $told->{$_} = 1 for @new;
+  my @score = map { 0 + sprintf( '%.2f', $now->{$_}{confidence} ) } @new;
+  my ($picture) = grep { defined && $_ ne '' } map { $now->{$_}{picture} } @new;
+  my $text  = 'detected:' . join( ' ', map { "$new[$_]:" . sprintf( '%d%%', $score[$_] * 100 + 0.5 ) } 0 .. $#new );
+  main::Info("Alert rules: $text joined the alarm of event $eid");
+  return ( $text, { labels => \@new, confidences => \@score, frame_id => 'alarm', source => 'live detection' }, $picture );
+}
+
+# The event's folder, from ZoneMinder (a sub of its own so tests can stand in).
+sub _event_path {
+  my $eid = shift;
+  require ZoneMinder::Event;
+  return ZoneMinder::Event->new($eid)->Path();
+}
+
+# The picture live detection kept, as the event's objdetect.jpg, which the
+# phone app shows as its detection picture: only if it has none yet, so the
+# frame of the event's first alert stays. 1 if it was written.
+sub picture_to_event {
+  my ( $eid, $picture ) = @_;
+  my $dir = _settings()->{pictures};
+  return 0 if !$dir || !defined $picture || $picture !~ /^[\w.-]+\.jpg$/;
+  my $ok = eval {
+    my $path = _event_path($eid);
+    die "no folder for event $eid\n" if !$path || !-d $path;
+    my $to = "$path/objdetect.jpg";
+    return 0 if -e $to;
+    require File::Copy;
+    File::Copy::copy( "$dir/$picture", "$to.tmp" ) or die "copying $picture: $!\n";
+    rename( "$to.tmp", $to ) or die "renaming it: $!\n";
+    1;
+  };
+  if ( !defined $ok ) {
+    ( my $err = $@ ) =~ s/\s+$//;
+    main::Error("Alert rules: event ${eid}'s picture wasn't written: $err");
+    return 0;
+  }
+  return $ok;
 }
 
 sub _hash { return sha256_hex( Encode::encode_utf8( $_[0] ) ); }

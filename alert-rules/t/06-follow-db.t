@@ -1,0 +1,249 @@
+#!/usr/bin/env perl
+# Following an event (ALERT-RULES.md, "Following an event"; cluster-docs O477):
+# while an event is on, a type that joins live detection's alarm is sent at
+# once, alone, through the rules; each type once per event; the start's types
+# aren't sent again; a type the rules refuse stays refused; the frame it first
+# alarmed on becomes the event's objdetect.jpg if it has none. Drives
+# processNewAlarmsInFork against a real MariaDB, with sleep standing in for
+# time: each "second" live detection may add a row, and the event ends when
+# the test says.
+use strict;
+use warnings;
+no warnings 'once';
+our ( $ticks, $on_tick );
+BEGIN { *CORE::GLOBAL::sleep = sub { $main::ticks++; $main::on_tick->($main::ticks) if $main::on_tick; 0 } }
+use FindBin;
+use lib "$FindBin::Bin/../../";
+use lib "$FindBin::Bin/lib";
+
+use Test::More;
+use File::Temp qw(tempdir);
+use JSON;
+use AlertRulesTest;
+
+use ZmEventNotification::Config qw(:all);
+use ZmEventNotification::Constants qw(:all);
+
+our ( @sent, @tags, $current );
+
+BEGIN {
+  for my $pkg (qw(ZmEventNotification::FCM ZmEventNotification::MQTT ZmEventNotification::DB ZmEventNotification::WebSocketHandler)) {
+    ( my $file = $pkg ) =~ s{::}{/}g;
+    $INC{"$file.pm"} = 1;
+  }
+  no strict 'refs';
+  *{'ZmEventNotification::FCM::sendOverFCM'} = sub { push @main::sent, [ $_[1]->{id}, $_[0]->{Cause}, $_[0]->{DetectionJson}{labels} ] };
+  *{'ZmEventNotification::FCM::import'} = sub {
+    my $caller = caller;
+    no strict 'refs';
+    *{"${caller}::sendOverFCM"} = \&ZmEventNotification::FCM::sendOverFCM;
+  };
+  *{'ZmEventNotification::MQTT::sendOverMQTTBroker'} = sub { };
+  *{'ZmEventNotification::MQTT::import'} = sub {
+    my $caller = caller;
+    no strict 'refs';
+    *{"${caller}::sendOverMQTTBroker"} = \&ZmEventNotification::MQTT::sendOverMQTTBroker;
+  };
+  *{'ZmEventNotification::DB::updateEventinZmDB'}   = sub { };
+  *{'ZmEventNotification::DB::getNotesFromEventDB'} = sub {''};
+  *{'ZmEventNotification::DB::tagEventObjects'}     = sub { push @main::tags, [ @{ $_[1] } ] };
+  *{'ZmEventNotification::DB::import'} = sub {
+    my $caller = caller;
+    no strict 'refs';
+    *{"${caller}::$_"} = \&{"ZmEventNotification::DB::$_"} for qw(updateEventinZmDB getNotesFromEventDB tagEventObjects);
+  };
+  *{'ZmEventNotification::WebSocketHandler::getNotificationStatusEsControl'} = sub {0};
+  *{'ZmEventNotification::WebSocketHandler::import'} = sub {
+    my $caller = caller;
+    no strict 'refs';
+    *{"${caller}::getNotificationStatusEsControl"} = \&ZmEventNotification::WebSocketHandler::getNotificationStatusEsControl;
+  };
+}
+
+my ( $dbh, $zm, $ours ) = AlertRulesTest::database();
+END { AlertRulesTest::drop_databases( $dbh, $zm, $ours ) if $dbh && $dbh->ping }
+
+use_ok('ZmEventNotification::HookProcessor');
+use_ok('ZmEventNotification::AlertRules');
+
+my $data     = tempdir( CLEANUP => 1 );
+my $pictures = tempdir( CLEANUP => 1 );
+my $events   = tempdir( CLEANUP => 1 );
+mkdir "$data/push" or die $!;
+my $hook = "$data/hook.pl";
+open( my $h, '>', $hook ) or die $!;
+print $h 'print $ENV{TEST_HOOK_OUT} // ""; exit( $ENV{TEST_HOOK_EXIT} // 0 );', "\n";
+close($h);
+
+sub config {
+  my %more = @_;
+  AlertRulesTest::config( { enable => 'yes', database => $ours, follow => 'yes', follow_seconds => 1, pictures => $pictures, %more } );
+  $server_config{base_data_path}                     = $data;
+  $hooks_config{enabled}                             = 1;
+  $hooks_config{event_start_hook}                    = "$^X $hook";
+  $hooks_config{event_end_hook}                      = undef;
+  $hooks_config{hook_pass_image_path}                = 0;
+  $hooks_config{use_hook_description}                = 1;
+  $hooks_config{tag_detected_objects}                = 1;
+  $hooks_config{hook_skip_monitors}                  = '';
+  $hooks_config{event_start_notify_on_hook_success}  = 'all';
+  $hooks_config{event_start_notify_on_hook_fail}     = 'none';
+  $notify_config{send_event_start_notification}      = 1;
+  $notify_config{send_event_end_notification}        = 0;
+  $escontrol_config{enabled}                         = 0;
+}
+$main::dbh = $dbh;
+$dbh->do('CREATE TABLE Events (Id BIGINT UNSIGNED NOT NULL PRIMARY KEY, MonitorId INT UNSIGNED, StartDateTime DATETIME(6))') or die $dbh->errstr;
+$dbh->do("INSERT INTO Users (Id, Username) VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')") or die $dbh->errstr;
+# alice: people on the camera; bob: people and cars; carol: trucks only
+$dbh->do( "INSERT INTO `$ours`.alert_rules (user_id, monitor_id, alerts, labels) VALUES (1, 5, 1, ?), (2, 5, 1, ?), (3, 5, 1, ?)",
+  undef, encode_json( ['person'] ), encode_json( [ 'person', 'car' ] ), encode_json( ['truck'] ) )
+  or die $dbh->errstr;
+
+{
+  no warnings 'redefine';
+  *ZmEventNotification::AlertRules::_event_path = sub { "$events/$_[0]" };
+}
+
+our $state;
+{
+  no warnings 'redefine';
+  *main::zmGetMonitorState = sub { $main::state };
+  *main::zmGetLastEvent    = sub { $main::current };
+}
+
+# Live detection's row for a type in the alarm raised at $raised, seen now.
+sub alarmed {
+  my ( $label, $confidence, $raised, $picture ) = @_;
+  $dbh->do(
+    "INSERT INTO `$ours`.detector_alarms VALUES (5, ?, ?, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6), ?, ?, ?)"
+      . ' ON DUPLICATE KEY UPDATE last_seen = UTC_TIMESTAMP(6)',
+    undef, $raised, $label, $confidence, $label eq 'car' ? 1 : 0, $picture
+  ) or die $dbh->errstr;
+}
+
+sub conns {
+  my $n = 0;
+  return map { { type => FCM, pushstate => 'enabled', state => INVALID_CONNECTION, id => $_, token => "token-$_-" . ( ++$n ) x 12,
+                 monlist => '5', intlist => '0', user => $_ } } qw(alice bob carol);
+}
+
+# One event on camera 5, started a second ago. %$script: tick => code. The
+# event ends at tick $end.
+sub run_event {
+  my ( $eid, $end, %script ) = @_;
+  @sent = @tags = ();
+  @AlertRulesTest::log = ();
+  unlink "$data/push/last_sent.json";
+  $dbh->do( 'REPLACE INTO Events VALUES (?, 5, NOW(6) - INTERVAL 1 SECOND)', undef, $eid ) or die $dbh->errstr;
+  mkdir "$events/$eid";
+  $main::current = $eid;
+  my $pipe = '';
+  open( my $w, '>', \$pipe ) or die $!;
+  *main::WRITER = *$w;
+  @main::active_connections = conns();
+  $main::state = 4;    # in alarm
+  $main::ticks = 0;
+  $main::on_tick = sub {
+    my $t = shift;
+    $script{$t}->() if $script{$t};
+    $main::state = main::STATE_IDLE() if $t >= $end;
+  };
+  ZmEventNotification::HookProcessor::processNewAlarmsInFork(
+    { Alarm => { MonitorId => 5, EventId => $eid, MonitorName => 'Garage Mast Camera', Start => { State => 'pending', Cause => 'Detected' } },
+      MonitorObj => {} } );
+  $main::on_tick = undef;
+  return [ grep {/^event_description/} split /\n/, $pipe ];
+}
+
+sub who { return [ sort map { $_->[0] } @_ ] }
+
+subtest 'a type that joins the alarm is sent at once, alone, through the rules; each once' => sub {
+  config();
+  $dbh->do("DELETE FROM `$ours`.detector_alarms");
+  my $raised = '2030-01-01 00:00:00';    # later than the event's start, so it's the event's
+  alarmed( 'car', 0.90, $raised, 'car.jpg' );
+  open( my $p, '>', "$pictures/car.jpg" ) or die $!;
+  print $p 'the car frame';
+  close($p);
+  open( $p, '>', "$pictures/person.jpg" ) or die $!;
+  print $p 'the person frame';
+  close($p);
+  local $ENV{TEST_HOOK_OUT}  = 'detected:car:90%--SPLIT--{"labels":["car"]}';
+  local $ENV{TEST_HOOK_EXIT} = 0;
+  my $desc = run_event(
+    100, 8,
+    2 => sub { alarmed( 'person', 0.72, $raised, 'person.jpg' ) },
+    3 => sub { alarmed( 'car', 0.95, $raised ) },              # seen again: already told
+    5 => sub { alarmed( 'truck', 0.66, '2030-01-01 00:00:09', 'truck.jpg' ) },
+  );
+  my @start  = grep { $_->[1] =~ /^detected:car/ } @sent;
+  my @person = grep { $_->[1] =~ /^detected:person/ } @sent;
+  my @truck  = grep { $_->[1] =~ /^detected:truck/ } @sent;
+  is_deeply( who(@start),  ['bob'],            'the start (a car): bob, who has cars on' );
+  is_deeply( who(@person), [ 'alice', 'bob' ], 'a person joins: alice and bob, at once' );
+  is_deeply( $person[0][2], ['person'], 'alone: only the type that joined' );
+  like( $person[0][1], qr/^detected:person:72% Detected$/, 'its text as the hook\'s, before the event\'s cause' );
+  is_deeply( who(@truck), ['carol'], 'a truck joins: carol only; nobody else has trucks on' );
+  is( scalar(@sent), 4, 'nothing sent twice: the car seen again isn\'t sent again' );
+  is_deeply( \@tags, [ ['car'], ['person'], ['truck'] ], 'the start\'s type, then each joined type, tagged on the event' );
+  is( scalar( grep {/detected:person:72%/} @$desc ) + scalar( grep {/detected:truck:66%/} @$desc ), 2, 'and its text put before the notes' );
+  open( my $o, '<', "$events/100/objdetect.jpg" ) or die "no objdetect.jpg: $!";
+  is( scalar(<$o>), 'the person frame', 'the picture: the frame the first joined type alarmed on' );
+  close($o);
+};
+
+subtest 'nothing at the start: the first type to alarm is sent, and its frame is the picture' => sub {
+  config();
+  $dbh->do("DELETE FROM `$ours`.detector_alarms");
+  local $ENV{TEST_HOOK_OUT}  = '';
+  local $ENV{TEST_HOOK_EXIT} = 1;
+  run_event( 101, 4, 1 => sub { alarmed( 'person', 0.81, '2030-01-01 00:00:00', 'person.jpg' ) } );
+  is_deeply( who(@sent), [ 'alice', 'bob' ], 'the person: alice and bob' );
+  ok( -e "$events/101/objdetect.jpg", 'the event has its picture' );
+};
+
+subtest 'an event that already has its picture keeps it' => sub {
+  config();
+  $dbh->do("DELETE FROM `$ours`.detector_alarms");
+  mkdir "$events/102";
+  open( my $p, '>', "$events/102/objdetect.jpg" ) or die $!;
+  print $p 'the start frame';
+  close($p);
+  local $ENV{TEST_HOOK_OUT}  = '';
+  local $ENV{TEST_HOOK_EXIT} = 1;
+  run_event( 102, 3, 1 => sub { alarmed( 'person', 0.81, '2030-01-01 00:00:00', 'person.jpg' ) } );
+  open( my $o, '<', "$events/102/objdetect.jpg" ) or die $!;
+  is( scalar(<$o>), 'the start frame', 'unchanged' );
+  close($o);
+};
+
+subtest 'an alarm over before the event started isn\'t the event\'s' => sub {
+  config();
+  $dbh->do("DELETE FROM `$ours`.detector_alarms");
+  $dbh->do( "INSERT INTO `$ours`.detector_alarms VALUES (5, '2020-01-01', 'person', '2020-01-01', '2020-01-01', 0.9, 1, NULL)" ) or die $dbh->errstr;
+  local $ENV{TEST_HOOK_OUT}  = '';
+  local $ENV{TEST_HOOK_EXIT} = 1;
+  run_event( 103, 3 );
+  is( scalar(@sent), 0, 'nothing sent' );
+};
+
+subtest 'not following: as before, one decision at the start' => sub {
+  config( follow => 'no' );
+  $dbh->do("DELETE FROM `$ours`.detector_alarms");
+  local $ENV{TEST_HOOK_OUT}  = '';
+  local $ENV{TEST_HOOK_EXIT} = 1;
+  run_event( 104, 3, 1 => sub { alarmed( 'person', 0.81, '2030-01-01 00:00:00' ) } );
+  is( scalar(@sent), 0, 'the person that joined isn\'t sent' );
+  ok( !ZmEventNotification::AlertRules::following(), 'following is off unless set' );
+};
+
+subtest 'the table away: said once for the event, and the event goes on' => sub {
+  config( database => 'no_such_database' );
+  local $ENV{TEST_HOOK_OUT}  = 'detected:car:90%--SPLIT--{"labels":["car"]}';
+  local $ENV{TEST_HOOK_EXIT} = 0;
+  run_event( 105, 4 );
+  is( AlertRulesTest::logged( error => qr/what has alarmed in event 105 couldn't be read/ ), 1, 'logged once' );
+};
+
+done_testing();
