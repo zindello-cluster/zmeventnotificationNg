@@ -95,7 +95,11 @@ sub config {
   $escontrol_config{enabled}                         = 0;
 }
 $main::dbh = $dbh;
-$dbh->do('CREATE TABLE Events (Id BIGINT UNSIGNED NOT NULL PRIMARY KEY, MonitorId INT UNSIGNED, StartDateTime DATETIME(6))') or die $dbh->errstr;
+$dbh->do( 'CREATE TABLE Events (Id BIGINT UNSIGNED NOT NULL PRIMARY KEY, MonitorId INT UNSIGNED, StartDateTime DATETIME(6), '
+    . 'EndDateTime DATETIME NULL, Cause VARCHAR(32), AlarmFrames INT UNSIGNED NOT NULL DEFAULT 0, Notes TEXT)' ) or die $dbh->errstr;
+$dbh->do('CREATE TABLE Tags (Id INT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, Name VARCHAR(64) NOT NULL UNIQUE)') or die $dbh->errstr;
+$dbh->do('CREATE TABLE Events_Tags (TagId INT UNSIGNED NOT NULL, EventId BIGINT UNSIGNED NOT NULL, PRIMARY KEY (TagId, EventId))') or die $dbh->errstr;
+$dbh->do("INSERT INTO Tags (Name) VALUES ('car'), ('person'), ('mine')") or die $dbh->errstr;
 $dbh->do("INSERT INTO Users (Id, Username) VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')") or die $dbh->errstr;
 # alice: people on the camera; bob: people and cars; carol: trucks only
 $dbh->do( "INSERT INTO `$ours`.alert_rules (user_id, monitor_id, alerts, labels) VALUES (1, 5, 1, ?), (2, 5, 1, ?), (3, 5, 1, ?)",
@@ -130,14 +134,20 @@ sub conns {
                  monlist => '5', intlist => '0', user => $_ } } qw(alice bob carol);
 }
 
-# One event on camera 5, started a second ago. %$script: tick => code. The
-# event ends at tick $end.
+# One event on camera 5, started a second ago (or `ago` seconds). %$script:
+# tick => code; `cause`, the event's; `keep`, to keep what was told of earlier
+# events' alarms. ZoneMinder moves to the next event at tick $end.
 sub run_event {
   my ( $eid, $end, %script ) = @_;
+  my $cause = delete $script{cause} // 'Detected';
+  my $ago   = delete $script{ago}   // 1;
+  my $keep  = delete $script{keep};
   @sent = @tags = ();
   @AlertRulesTest::log = ();
   unlink "$data/push/last_sent.json";
-  $dbh->do( 'REPLACE INTO Events VALUES (?, 5, NOW(6) - INTERVAL 1 SECOND)', undef, $eid ) or die $dbh->errstr;
+  unlink "$data/push/alarms_sent.json" if !$keep;
+  $dbh->do( 'REPLACE INTO Events (Id, MonitorId, StartDateTime, Cause) VALUES (?, 5, NOW(6) - INTERVAL ? SECOND, ?)', undef, $eid, $ago, $cause )
+    or die $dbh->errstr;
   mkdir "$events/$eid";
   $main::current = $eid;
   my $pipe = '';
@@ -149,10 +159,10 @@ sub run_event {
   $main::on_tick = sub {
     my $t = shift;
     $script{$t}->() if $script{$t};
-    $main::state = main::STATE_IDLE() if $t >= $end;
+    $main::current = 0 if $t >= $end;    # ZoneMinder's next event
   };
   ZmEventNotification::HookProcessor::processNewAlarmsInFork(
-    { Alarm => { MonitorId => 5, EventId => $eid, MonitorName => 'Garage Mast Camera', Start => { State => 'pending', Cause => 'Detected' } },
+    { Alarm => { MonitorId => 5, EventId => $eid, MonitorName => 'Garage Mast Camera', Start => { State => 'pending', Cause => $cause } },
       MonitorObj => {} } );
   $main::on_tick = undef;
   return [ grep {/^event_description/} split /\n/, $pipe ];
@@ -249,6 +259,84 @@ subtest 'one push per event for each phone, raised by the first type its user ha
   );
   is_deeply( [ map { [ $_->[0], $_->[2] ] } @sent ], [ [ 'bob', ['car'] ], [ 'alice', ['person'] ], [ 'carol', ['truck'] ] ],
     'bob for the car; alice for the person, and not bob again; carol for the truck' );
+};
+
+subtest 'one alarm, one push for each phone, though it runs on into the next event' => sub {
+  config();
+  $dbh->do("DELETE FROM `$ours`.detector_alarms");
+  local $ENV{TEST_HOOK_OUT}  = '';
+  local $ENV{TEST_HOOK_EXIT} = 1;
+  run_event( 120, 3, 1 => sub { alarmed( 'person', 0.81, '2030-01-02 00:00:00' ) } );
+  is_deeply( who(@sent), [ 'alice', 'bob' ], 'the person: alice and bob' );
+  # ZoneMinder's next event, the same alarm still on: its start hook answers with it
+  local $ENV{TEST_HOOK_OUT}  = 'detected:person:81%--SPLIT--{"labels":["person"],"alarms":{"person":["2030-01-02 00:00:00.000000"]}}';
+  local $ENV{TEST_HOOK_EXIT} = 0;
+  run_event( 121, 4, keep => 1, 2 => sub { alarmed( 'person', 0.81, '2030-01-02 00:00:00' ) } );
+  is( scalar(@sent), 0, 'the next event: nobody told again of the same alarm' );
+  ok( AlertRulesTest::logged( info => qr/no alert to alice's phone .*told of this alarm already/ ), 'and the log says why' );
+  # A new alarm with a person in it, in that event: a new push
+  run_event( 122, 4, keep => 1, cause => 'Detected', 2 => sub { alarmed( 'person', 0.9, '2030-01-02 00:01:00' ) } );
+  is_deeply( who(@sent), [ 'alice', 'bob' ], 'a new alarm: told' );
+};
+
+subtest 'an event goes on after its alarm ends: a second alarm in it is told' => sub {
+  config();
+  $dbh->do("DELETE FROM `$ours`.detector_alarms");
+  local $ENV{TEST_HOOK_OUT}  = 'detected:car:90%--SPLIT--{"labels":["car"]}';
+  local $ENV{TEST_HOOK_EXIT} = 0;
+  run_event( 130, 6,
+    1 => sub { $main::state = main::STATE_TAPE() },    # the car's alarm over; ZoneMinder records on in the same event
+    3 => sub { alarmed( 'person', 0.88, '2030-01-03 00:00:00' ); $main::state = 4 } );
+  is_deeply( [ map { $_->[0] } @sent ], [ 'bob', 'alice' ], 'bob for the car; alice for the person, in the same event' );
+};
+
+subtest 'an event that ends with no alarm frames gives back its tags, notes and picture' => sub {
+  config();
+  $dbh->do("DELETE FROM `$ours`.detector_alarms");
+  $dbh->do('DELETE FROM Events_Tags');
+  mkdir "$events/140";
+  open( my $p, '>', "$events/140/objdetect.jpg" ) or die $!;
+  print $p 'given';
+  close($p);
+  local $ENV{TEST_HOOK_OUT}  = 'detected:car:90%--SPLIT--{"labels":["car"]}';
+  local $ENV{TEST_HOOK_EXIT} = 0;
+  run_event( 140, 3, 3 => sub {
+    $dbh->do("UPDATE Events SET EndDateTime = NOW(), AlarmFrames = 0, Notes = 'detected:car:90% ' WHERE Id = 140");
+    $dbh->do("INSERT INTO Events_Tags SELECT Id, 140 FROM Tags WHERE Name IN ('car', 'mine')");
+  } );
+  is_deeply( $dbh->selectcol_arrayref('SELECT t.Name FROM Events_Tags et JOIN Tags t ON t.Id = et.TagId WHERE et.EventId = 140'),
+    ['mine'], 'its car tag taken off; a tag it wasn\'t given kept' );
+  is( $dbh->selectrow_array('SELECT Notes FROM Events WHERE Id = 140'), '', 'the text taken off its notes' );
+  ok( !-e "$events/140/objdetect.jpg", 'its picture taken off' );
+};
+
+subtest 'an event that ends with alarm frames keeps them' => sub {
+  config();
+  $dbh->do('DELETE FROM Events_Tags');
+  local $ENV{TEST_HOOK_OUT}  = 'detected:car:90%--SPLIT--{"labels":["car"]}';
+  local $ENV{TEST_HOOK_EXIT} = 0;
+  run_event( 141, 3, 3 => sub {
+    $dbh->do("UPDATE Events SET EndDateTime = NOW(), AlarmFrames = 40 WHERE Id = 141");
+    $dbh->do("INSERT INTO Events_Tags SELECT Id, 141 FROM Tags WHERE Name = 'car'");
+  } );
+  is( $dbh->selectrow_array('SELECT COUNT(*) FROM Events_Tags WHERE EventId = 141'), 1, 'its tag kept' );
+};
+
+subtest 'an alarm raised in a continuous section is the alarmed event\'s that ZoneMinder opens for it' => sub {
+  config();
+  $dbh->do("DELETE FROM `$ours`.detector_alarms");
+  $dbh->do('DELETE FROM Events WHERE Id = 151');
+  local $ENV{TEST_HOOK_OUT}  = '';
+  local $ENV{TEST_HOOK_EXIT} = 1;
+  run_event( 150, 4, cause => 'Continuous', ago => 10,
+    1 => sub {    # a person raises an alarm: now, inside the section
+      $dbh->do( "INSERT INTO `$ours`.detector_alarms VALUES (5, UTC_TIMESTAMP(6), 'person', UTC_TIMESTAMP(6), UTC_TIMESTAMP(6), 0.9, 1, NULL)" );
+    },
+    2 => sub {    # and ZoneMinder opens the alarmed event, from a moment before
+      $dbh->do("INSERT INTO Events (Id, MonitorId, StartDateTime, Cause) VALUES (151, 5, NOW(6) - INTERVAL 3 SECOND, 'Detected')");
+    } );
+  is( scalar(@sent), 0, 'nothing told in the section: the alarm is the next event\'s' );
+  is_deeply( \@tags, [], 'nor tagged' );
 };
 
 subtest 'an alarm over before the event started isn\'t the event\'s' => sub {

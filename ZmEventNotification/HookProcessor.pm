@@ -486,12 +486,14 @@ sub hookLimitReached {
 # becomes the event's picture if the event has none, or if this is the
 # event's first push and the picture there is of a type nobody was sent.
 sub _sendJoined {
-  my ( $alarm, $mname, $mid, $eid, $told, $first_cause, $pushed ) = @_;
+  my ( $alarm, $mname, $mid, $eid, $told, $first_cause, $pushed, $given ) = @_;
   my ( $text, $det, $picture ) = ZmEventNotification::AlertRules::joined( $eid, $mid, $told );
   return if !$text;
   my $json = encode_json($det);
   print main::WRITER 'event_description--TYPE--' . $mid . '--SPLIT--' . $eid . '--SPLIT--' . $text . "\n";
   _tag_detected_objects( $eid, $json, 'event_joined' );
+  push @{ $given->{texts} }, $text;
+  $given->{labels}{$_} = 1 for @{ $det->{labels} };
 
   my ( $rulesAllowed, $rulesObject ) = isAllowedInRules($alarm);
   if ( !$rulesAllowed ) {
@@ -515,6 +517,13 @@ sub _sendJoined {
   }
   ZmEventNotification::AlertRules::picture_to_event( $eid, $picture, $sent && $first_push );
   return;
+}
+
+# zindello-cluster: whether ZoneMinder has closed the event (EndDateTime set).
+sub _eventEnded {
+  my $eid = shift;
+  return 0 if !defined &ZmEventNotification::DB::isEventEnded;
+  return ZmEventNotification::DB::isEventEnded($eid) ? 1 : 0;
 }
 
 # zindello-cluster: a connection, as the one push per event counts it.
@@ -542,6 +551,7 @@ sub processNewAlarmsInFork {
   # zindello-cluster: alert rules, following the event (ALERT-RULES.md)
   my %told;
   my %pushed;    # the connections this event's push has gone to
+  my %given = ( texts => [], labels => {} );    # the notes' texts and tags it was given, taken off if it had no alarm
   my $first_cause = $alarm->{Start}->{Cause};
 
   my $start_time = time();
@@ -604,9 +614,12 @@ sub processNewAlarmsInFork {
               . $resTxt . "\n";
 
             $hookString = $resTxt;
+            # zindello-cluster: what it was given, in case it turns out to have had no alarm
+            push @{ $given{texts} }, $resTxt;
           }
 
           _tag_detected_objects($eid, $resJsonString, 'event_start') if $hookResult == 0;
+          $given{labels}{$_} = 1 for $hookResult == 0 ? ZmEventNotification::AlertRules::labels( $alarm->{Start} ) : ();
         } else {
           main::Info(
             'use hooks/start hook not being used, going to directly send out a notification if checks pass'
@@ -619,7 +632,7 @@ sub processNewAlarmsInFork {
     } elsif ( $alarm->{Start}->{State} eq 'ready' ) {
 
       # zindello-cluster: the types told of at the start aren't told again
-      $told{$_} = 1 for ZmEventNotification::AlertRules::labels( $alarm->{Start} );
+      ZmEventNotification::AlertRules::told_at_start( $alarm->{Start}, \%told );
 
       my ( $rulesAllowed, $rulesObject ) = isAllowedInRules($alarm);
       if ( !$rulesAllowed ) {
@@ -777,12 +790,18 @@ sub processNewAlarmsInFork {
       $alarm->{End}->{State} = 'done';
     }
     elsif ( ($alarm->{End}->{State} // '') eq 'done' ) {
+      # zindello-cluster: an event that had no alarm frames gives back what it
+      # was given (ALERT-RULES.md, "One alarm, one push")
+      if ( ZmEventNotification::AlertRules::following() && ( @{ $given{texts} } || %{ $given{labels} } ) ) {
+        my $af = ZmEventNotification::AlertRules::alarm_frames( $eid, 5 );
+        ZmEventNotification::AlertRules::untell( $eid, [ sort keys %{ $given{labels} } ], $given{texts} ) if defined $af && $af == 0;
+      }
       $doneProcessing = 1;
     }
 
     # zindello-cluster: alert rules, following the event (ALERT-RULES.md)
     if ( $alarm->{Start}->{State} eq 'done' && !$endProcessed && ZmEventNotification::AlertRules::following() ) {
-      _sendJoined( $alarm, $mname, $mid, $eid, \%told, $first_cause, \%pushed );
+      _sendJoined( $alarm, $mname, $mid, $eid, \%told, $first_cause, \%pushed, \%given );
     }
 
     if ( !main::zmMemVerify($monitor) ) {
@@ -794,7 +813,12 @@ sub processNewAlarmsInFork {
       my $state   = main::zmGetMonitorState($monitor);
       my $shm_eid = main::zmGetLastEvent($monitor);
 
-      if ( ( $state == main::STATE_IDLE() || $state == main::STATE_TAPE() || $shm_eid != $eid )
+      # zindello-cluster: while following, the event goes on until ZoneMinder
+      # moves to the next one (or closes it), not only while its alarm is on:
+      # a second alarm in the same event is the event's too.
+      my $quiet = ( $state == main::STATE_IDLE() || $state == main::STATE_TAPE() );
+      $quiet &&= _eventEnded($eid) if ZmEventNotification::AlertRules::following();
+      if ( ( $quiet || $shm_eid != $eid )
         && !$endProcessed ) {
         main::Debug(2, "For $mid ($mname), SHM says: state=$state, eid=$shm_eid");
         main::Info("Event $eid for Monitor $mid has finished");
