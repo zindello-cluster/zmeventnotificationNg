@@ -25,9 +25,11 @@ package ZmEventNotification::AlertRules;
 # camera's alarm to detector_alarms, in the same database. While an event is
 # on, its fork asks here every follow_seconds which types have alarmed on its
 # camera since it started; a type not yet told of in this event is sent on its
-# own, through sendEvent and so through the rules, once per event. The frame
-# it first alarmed on becomes the event's objdetect.jpg, if the event has none
-# yet (the owner: "Let's go with C."; cluster-docs O478).
+# own, through sendEvent and so through the rules, to the phones that haven't
+# had this event's push: one push per event for each phone (the owner: "Per
+# event", cluster-docs O481). The frame it first alarmed on becomes the
+# event's objdetect.jpg, as zm_detect's picture was, if the event has none, or
+# if it raised the event's first push (the owner: "Let's go with C."; O478).
 #
 # It uses the event server's own database connection, ZoneMinder's. Nothing
 # here may stop a push or the daemon: if the rules can't be read the alert is
@@ -280,17 +282,18 @@ sub _event_path {
 }
 
 # The picture live detection kept, as the event's objdetect.jpg, which the
-# phone app shows as its detection picture: only if it has none yet, so the
-# frame of the event's first alert stays. 1 if it was written.
+# phone app shows as its detection picture: only if it has none yet, or, with
+# $replace, in place of one (the frame of the type that raised the event's
+# first push, over one of a type nobody was sent). 1 if it was written.
 sub picture_to_event {
-  my ( $eid, $picture ) = @_;
+  my ( $eid, $picture, $replace ) = @_;
   my $dir = _settings()->{pictures};
   return 0 if !$dir || !defined $picture || $picture !~ /^[\w.-]+\.jpg$/;
   my $ok = eval {
     my $path = _event_path($eid);
     die "no folder for event $eid\n" if !$path || !-d $path;
     my $to = "$path/objdetect.jpg";
-    return 0 if -e $to;
+    return 0 if -e $to && !$replace;
     require File::Copy;
     File::Copy::copy( "$dir/$picture", "$to.tmp" ) or die "copying $picture: $!\n";
     rename( "$to.tmp", $to ) or die "renaming it: $!\n";

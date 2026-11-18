@@ -1,9 +1,11 @@
 #!/usr/bin/env perl
-# Following an event (ALERT-RULES.md, "Following an event"; cluster-docs O477):
-# while an event is on, a type that joins live detection's alarm is sent at
-# once, alone, through the rules; each type once per event; the start's types
-# aren't sent again; a type the rules refuse stays refused; the frame it first
-# alarmed on becomes the event's objdetect.jpg if it has none. Drives
+# Following an event (ALERT-RULES.md, "Following an event"; cluster-docs O477,
+# O481): while an event is on, a type that joins live detection's alarm is sent
+# at once, alone, through the rules, to the phones that haven't had this
+# event's push: one push per event for each phone; the start's types aren't
+# sent again; a type the rules refuse stays refused; the frame it first
+# alarmed on becomes the event's objdetect.jpg if it has none, or if it raised
+# the event's first push. Drives
 # processNewAlarmsInFork against a real MariaDB, with sleep standing in for
 # time: each "second" live detection may add a row, and the event ends when
 # the test says.
@@ -158,7 +160,7 @@ sub run_event {
 
 sub who { return [ sort map { $_->[0] } @_ ] }
 
-subtest 'a type that joins the alarm is sent at once, alone, through the rules; each once' => sub {
+subtest 'a type that joins the alarm is sent at once, alone, through the rules, to phones not yet told' => sub {
   config();
   $dbh->do("DELETE FROM `$ours`.detector_alarms");
   my $raised = '2030-01-01 00:00:00';    # later than the event's start, so it's the event's
@@ -181,11 +183,11 @@ subtest 'a type that joins the alarm is sent at once, alone, through the rules; 
   my @person = grep { $_->[1] =~ /^detected:person/ } @sent;
   my @truck  = grep { $_->[1] =~ /^detected:truck/ } @sent;
   is_deeply( who(@start),  ['bob'],            'the start (a car): bob, who has cars on' );
-  is_deeply( who(@person), [ 'alice', 'bob' ], 'a person joins: alice and bob, at once' );
+  is_deeply( who(@person), ['alice'], 'a person joins: alice, at once; bob had this event\'s push' );
   is_deeply( $person[0][2], ['person'], 'alone: only the type that joined' );
   like( $person[0][1], qr/^detected:person:72% Detected$/, 'its text as the hook\'s, before the event\'s cause' );
   is_deeply( who(@truck), ['carol'], 'a truck joins: carol only; nobody else has trucks on' );
-  is( scalar(@sent), 4, 'nothing sent twice: the car seen again isn\'t sent again' );
+  is( scalar(@sent), 3, 'one push per event for each phone: nobody is sent twice' );
   is_deeply( \@tags, [ ['car'], ['person'], ['truck'] ], 'the start\'s type, then each joined type, tagged on the event' );
   is( scalar( grep {/detected:person:72%/} @$desc ) + scalar( grep {/detected:truck:66%/} @$desc ), 2, 'and its text put before the notes' );
   open( my $o, '<', "$events/100/objdetect.jpg" ) or die "no objdetect.jpg: $!";
@@ -203,7 +205,7 @@ subtest 'nothing at the start: the first type to alarm is sent, and its frame is
   ok( -e "$events/101/objdetect.jpg", 'the event has its picture' );
 };
 
-subtest 'an event that already has its picture keeps it' => sub {
+subtest 'the first push\'s frame replaces a picture of a type nobody was sent' => sub {
   config();
   $dbh->do("DELETE FROM `$ours`.detector_alarms");
   mkdir "$events/102";
@@ -214,8 +216,39 @@ subtest 'an event that already has its picture keeps it' => sub {
   local $ENV{TEST_HOOK_EXIT} = 1;
   run_event( 102, 3, 1 => sub { alarmed( 'person', 0.81, '2030-01-01 00:00:00', 'person.jpg' ) } );
   open( my $o, '<', "$events/102/objdetect.jpg" ) or die $!;
-  is( scalar(<$o>), 'the start frame', 'unchanged' );
+  is( scalar(<$o>), 'the person frame', 'the person, who raised the event\'s first push' );
   close($o);
+};
+
+subtest 'an event whose start was sent keeps its picture' => sub {
+  config();
+  $dbh->do("DELETE FROM `$ours`.detector_alarms");
+  mkdir "$events/106";
+  open( my $p, '>', "$events/106/objdetect.jpg" ) or die $!;
+  print $p 'the car frame, from the start';
+  close($p);
+  local $ENV{TEST_HOOK_OUT}  = 'detected:car:90%--SPLIT--{"labels":["car"]}';
+  local $ENV{TEST_HOOK_EXIT} = 0;
+  run_event( 106, 3, 1 => sub { alarmed( 'person', 0.81, '2030-01-01 00:00:00', 'person.jpg' ) } );
+  is_deeply( [ map { $_->[0] } @sent ], [ 'bob', 'alice' ], 'bob at the start, alice when the person joins' );
+  open( my $o, '<', "$events/106/objdetect.jpg" ) or die $!;
+  is( scalar(<$o>), 'the car frame, from the start', 'unchanged: the start was the event\'s first push' );
+  close($o);
+};
+
+subtest 'one push per event for each phone, raised by the first type its user has on' => sub {
+  config();
+  $dbh->do("DELETE FROM `$ours`.detector_alarms");
+  local $ENV{TEST_HOOK_OUT}  = '';
+  local $ENV{TEST_HOOK_EXIT} = 1;
+  run_event(
+    107, 6,
+    1 => sub { alarmed( 'car',    0.85, '2030-01-01 00:00:00' ) },
+    2 => sub { alarmed( 'person', 0.81, '2030-01-01 00:00:00' ) },
+    3 => sub { alarmed( 'truck',  0.70, '2030-01-01 00:00:00' ) },
+  );
+  is_deeply( [ map { [ $_->[0], $_->[2] ] } @sent ], [ [ 'bob', ['car'] ], [ 'alice', ['person'] ], [ 'carol', ['truck'] ] ],
+    'bob for the car; alice for the person, and not bob again; carol for the truck' );
 };
 
 subtest 'an alarm over before the event started isn\'t the event\'s' => sub {

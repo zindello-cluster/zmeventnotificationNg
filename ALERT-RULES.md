@@ -38,16 +38,19 @@ a comment where it sits, so a new upstream release merges cleanly:
 5. **The parent's tick** (`zmeventnotification.pl`) brings the list of phones up to date every 30
    seconds, and notes each push a fork reports for "last alert".
 
-6. **Following an event** (`AlertRules.pm`, `HookProcessor.pm`; cluster-docs O477, O478). The
-   owner: "If a current event is firing, and a category we notify about shows up, it should be
-   immediate." While an event is on, its fork asks every `follow_seconds` which types have raised
-   or held live detection's alarm on its camera since it started (`detector_alarms`, written by
-   the chart's live detection sidecar). A type not yet told of in this event is sent at once, on
-   its own, through `sendEvent` and so through the rules, to the connections the start would go
-   to; its text goes before the event's notes and it's tagged, as the start hook's are. Each type
-   once per event; the start's types aren't sent again. The frame it first alarmed on, which live
-   detection leaves in `pictures` with its boxes drawn, becomes the event's `objdetect.jpg` if the
-   event has none yet. Off unless set:
+6. **Following an event** (`AlertRules.pm`, `HookProcessor.pm`; cluster-docs O477, O478, O481).
+   The owner: "If a current event is firing, and a category we notify about shows up, it should be
+   immediate." and "Per event". While an event is on, its fork asks every `follow_seconds` which
+   types have raised or held live detection's alarm on its camera since it started
+   (`detector_alarms`, written by the chart's live detection sidecar). A type not yet seen in this
+   event is sent at once, on its own, through `sendEvent` and so through the rules, to each
+   connection the start would go to that hasn't had this event's push: one push per event for
+   each phone, raised by the first type its user has switched on. Its text goes before the event's
+   notes and it's tagged, as the start hook's are. `sendEvent` returns 1 when it sent, so the
+   fork knows who has had the push. The frame the type first alarmed on, which live detection
+   leaves in `pictures` with its boxes drawn, becomes the event's `objdetect.jpg` if the event has
+   none, or if it raised the event's first push (over a start picture of a type nobody was sent).
+   Off unless set:
    ```yaml
    alert_rules:
      follow: "yes"
