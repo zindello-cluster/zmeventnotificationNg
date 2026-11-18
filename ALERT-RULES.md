@@ -59,6 +59,27 @@ a comment where it sits, so a new upstream release merges cleanly:
    ```
    The fork's loop looks every `follow_seconds` while following, where upstream's waits 2 s.
 
+7. **One alarm, one push** (`AlertRules.pm`, `HookProcessor.pm`; cluster-docs O500, T181). The
+   owner: "Check it and fix please." ZoneMinder's events and live detection's alarms don't line
+   up: ZoneMinder starts a new event every few seconds while an alarm runs on, and keeps one event
+   open through more than one alarm. So:
+   - **a phone is told of an alarm once,** whichever event it's in. Each detection carries its
+     alarms' raise times (`alarms`), and each alarm a push is about is kept for that phone in
+     `push/alarms_sent.json` for a day; a push about alarms the phone has been told of already
+     isn't sent;
+   - **an event is followed until ZoneMinder moves on to the next one,** not only while its alarm
+     is on, so a second alarm in the same event is told;
+   - **an event's types are those whose alarm was on during it:** their last sighting, plus
+     `hold_seconds`, at or after its start, and their first before the next event's start. An
+     alarm raised once the event is at least the camera's `MinSectionLength` old (10 s) waits up
+     to 3 s for the new event ZoneMinder opens for it, and is that event's;
+   - **an event that ends with no alarm frames** has the tags, notes and picture it was given
+     taken off.
+   ```yaml
+   alert_rules:
+     hold_seconds: 5   # live detection's alarm.holdSeconds
+   ```
+
 `git log $(cat alert-rules/UPSTREAM_RELEASE)..alert-rules -- zmeventnotification.pl ZmEventNotification`
 lists them.
 

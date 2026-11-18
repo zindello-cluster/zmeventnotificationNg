@@ -18,6 +18,8 @@ package ZmEventNotification::AlertRules;
 #     pictures: /run/live-pictures  # where live detection leaves the frame
 #                          # each type first alarmed on, its boxes drawn;
 #                          # unset, no pictures
+#     hold_seconds: 5      # live detection's alarm.holdSeconds: an alarm
+#                          # stays on this long after its last sighting
 #
 # Following an event (the owner, 18 November 2026: "If a current event is
 # firing, and a category we notify about shows up, it should be immediate.";
@@ -31,6 +33,23 @@ package ZmEventNotification::AlertRules;
 # event's objdetect.jpg, as zm_detect's picture was, if the event has none, or
 # if it raised the event's first push (the owner: "Let's go with C."; O478).
 #
+# One alarm, one push (the owner: "Check it and fix please."; cluster-docs
+# O500). ZoneMinder's events and live detection's alarms don't line up: an
+# alarm may run on through several events (ZoneMinder starts a new one every
+# few seconds), and an event may hold more than one alarm. So:
+#   - a phone is told of an alarm once, whichever event it's in: each alarm a
+#     push is about is remembered for that phone (push/alarms_sent.json) and
+#     not told again;
+#   - an event is followed until ZoneMinder moves on to the next one, not only
+#     while its alarm is on, so a second alarm in the same event is seen;
+#   - an event's types are those whose alarm was on during it (their last
+#     sighting, plus hold_seconds, at or after its start, and their first
+#     before the next event's start); an alarm raised once the event is at
+#     least MinSectionLength old waits up to 3 s for the event ZoneMinder
+#     opens for it;
+#   - an event that ends with no alarm frames loses the tags, notes and
+#     picture given to it.
+#
 # It uses the event server's own database connection, ZoneMinder's. Nothing
 # here may stop a push or the daemon: if the rules can't be read the alert is
 # sent as it was before them, and a failed update of the phones table is
@@ -42,6 +61,8 @@ use JSON;
 use Digest::SHA qw(sha256_hex);
 use Encode ();
 use POSIX qw(strftime);
+use Fcntl ();
+use Time::Local qw(timegm);
 use ZmEventNotification::Constants qw(:all);
 use ZmEventNotification::Config qw(:all);
 use ZmEventNotification::FCM ();
@@ -51,19 +72,24 @@ use constant CACHE_SECONDS => 10;    # how long a rule that was read is used
 
 my $settings;
 my %cache;
-my %event_start;    # event id -> its start, seconds since the epoch
+my %event_start;    # event id -> { start, cause, next }: its start and the next event's, seconds since the epoch
 my %pushed;
 my $last_tick = 0;
 
 sub _settings {
   return $settings if $settings;
-  my ( $on, $db, $follow, $every, $pictures ) = ( 0, 'detector', 0, 1, undef );
+  my ( $on, $db, $follow, $every, $pictures, $hold ) = ( 0, 'detector', 0, 1, undef, 0 );
   if ($config_obj) {
     $on     = config_get_val( $config_obj, 'alert_rules', 'enable', 'no' ) ? 1 : 0;
     $db     = config_get_val( $config_obj, 'alert_rules', 'database', 'detector' );
     $follow = config_get_val( $config_obj, 'alert_rules', 'follow', 'no' ) ? 1 : 0;
     $every  = config_get_val( $config_obj, 'alert_rules', 'follow_seconds', 1 );
     $pictures = config_get_val( $config_obj, 'alert_rules', 'pictures', undef );
+    $hold     = config_get_val( $config_obj, 'alert_rules', 'hold_seconds', 0 );
+  }
+  if ( !defined $hold || $hold !~ /^\d+(\.\d+)?$/ ) {
+    main::Error("Alert rules: hold_seconds must be a number of seconds; 0 it is");
+    $hold = 0;
   }
   if ( !defined $every || $every !~ /^[1-9]\d*$/ ) {
     main::Error("Alert rules: follow_seconds must be a whole number of seconds, 1 or more; 1 it is");
@@ -74,7 +100,7 @@ sub _settings {
     $on = 0;
   }
   main::Info( "Alert rules are on, kept in the $db database" . ( $follow ? ", following each event every $every s" : '' ) ) if $on;
-  return $settings = { on => $on, db => $db, follow => $on && $follow, every => $every, pictures => $pictures };
+  return $settings = { on => $on, db => $db, follow => $on && $follow, every => $every, pictures => $pictures, hold => $hold };
 }
 
 sub enabled { return _settings()->{on}; }
@@ -190,12 +216,56 @@ sub _decide {
     $uid = $user->{id};
   }
   my $rule = _rule( $uid, $alarm->{MonitorId} );
-  return 1 if !$rule;
+  return _once( $alarm, $ac, [ labels($alarm) ] ) if !$rule;
   return ( 0, 'the camera is switched off' ) if !$rule->{alerts};
   my @found = labels($alarm);
   return 1 if !@found;
-  return 1 if grep { $rule->{labels}{$_} } @found;
+  my @on = grep { $rule->{labels}{$_} } @found;
+  return _once( $alarm, $ac, \@on ) if @on;
   return ( 0, join( ', ', @found ) . ( @found > 1 ? " aren't" : " isn't" ) . ' switched on for the camera' );
+}
+
+# The phone's key in push/alarms_sent.json: its token, or its connection.
+sub _phone_key {
+  my $ac = shift;
+  return ( $ac->{token} // '' ) ne '' ? 'token:' . _hash( $ac->{token} ) : 'connection:' . ( $ac->{id} // '' );
+}
+
+# One alarm, one push for each phone: 1 if the alarms behind these types
+# (the detections' `alarms`, live detection's raise times) include one this
+# phone hasn't been told of, and then they're remembered for it; (0, why) if
+# it has been told of them all. Detections without alarms (not ours) are
+# always sent. Kept a day.
+sub _once {
+  my ( $alarm, $ac, $types ) = @_;
+  my $det = $alarm->{DetectionJson};
+  my %ids;
+  if ( ref($det) eq 'HASH' && ref( $det->{alarms} ) eq 'HASH' ) {
+    foreach my $t (@$types) {
+      my $a = $det->{alarms}{$t};
+      $ids{"$alarm->{MonitorId}:$_"} = 1 for ref($a) eq 'ARRAY' ? @$a : defined $a ? ($a) : ();
+    }
+  }
+  return 1 if !%ids;
+  my $file = $server_config{base_data_path} . '/push/alarms_sent.json';
+  sysopen( my $fh, $file, Fcntl::O_RDWR() | Fcntl::O_CREAT(), 0600 ) or die "can't open $file: $!\n";
+  flock( $fh, Fcntl::LOCK_EX() ) or die "can't lock $file: $!\n";
+  my $raw  = do { local $/; <$fh> };
+  my $sent = eval { decode_json($raw) } // {};
+  my $now  = time();
+  foreach my $p ( keys %$sent ) {
+    delete @{ $sent->{$p} }{ grep { $now - $sent->{$p}{$_} > 86400 } keys %{ $sent->{$p} } };
+    delete $sent->{$p} if !%{ $sent->{$p} };
+  }
+  my $key = _phone_key($ac);
+  my @new = grep { !$sent->{$key}{$_} } keys %ids;
+  $sent->{$key}{$_} = $now for @new;
+  seek( $fh, 0, 0 );
+  truncate( $fh, 0 );
+  print $fh encode_json($sent);
+  close($fh);
+  return 1 if @new;
+  return ( 0, 'it was told of this alarm already, in an earlier event' );
 }
 
 # Asked by sendEvent, in an event's fork, for each phone or open connection
@@ -221,41 +291,94 @@ sub allows {
   return 0;
 }
 
-# The types that raised or held live detection's alarm on the camera since the
-# event started: { label => { confidence, picture } }, the picture the frame it
-# first alarmed on, if live detection kept one. Dies if they can't be read.
+# The event: its start, its cause, and the next event's start on the camera
+# once there is one (seconds since the epoch). ZoneMinder writes times in its
+# own zone, which its connection has.
+sub _event {
+  my ( $eid, $mid ) = @_;
+  my $e = $event_start{$eid};
+  if ( !$e ) {
+    my $rows = _rows( 'SELECT UNIX_TIMESTAMP(StartDateTime) AS t, Cause AS cause FROM Events WHERE Id = ?', $eid );
+    die "no event $eid\n" if !@$rows || !defined $rows->[0]{t};
+    my $msl = eval { _rows( 'SELECT MinSectionLength AS l FROM Monitors WHERE Id = ?', $mid )->[0]{l} };
+    $e = $event_start{$eid} = { start => $rows->[0]{t}, cause => $rows->[0]{cause} // '', min_section => $msl // 10 };
+  }
+  if ( !defined $e->{next} ) {
+    my $rows = _rows( 'SELECT UNIX_TIMESTAMP(StartDateTime) AS t FROM Events WHERE MonitorId = ? AND Id > ? ORDER BY Id LIMIT 1', $mid, $eid );
+    $e->{next} = $rows->[0]{t} if @$rows && defined $rows->[0]{t};
+  }
+  return $e;
+}
+
+sub _utc6 {
+  my $t = shift;
+  my $s = POSIX::floor($t);
+  return strftime( '%Y-%m-%d %H:%M:%S', gmtime($s) ) . sprintf( '.%06d', int( ( $t - $s ) * 1e6 + 0.5 ) % 1000000 );
+}
+
+sub _epoch {
+  my ( $y, $mo, $d, $h, $mi, $s, $f ) = $_[0] =~ /^(\d+)-(\d+)-(\d+) (\d+):(\d+):(\d+)(?:\.(\d+))?/ or return undef;
+  return timegm( $s, $mi, $h, $d, $mo - 1, $y ) + ( $f ? "0.$f" : 0 );
+}
+
+# The types whose live detection alarm was on during the event: their last
+# sighting, plus hold_seconds, at or after its start, and their first before
+# the next event's start. { label => { confidence, picture, alarms, inside } }:
+# the frame it first alarmed on, if live detection kept one; its alarms' raise
+# times; and whether every one of them was raised inside the event, after its
+# start (raised: the newest). Dies if they can't be read.
 sub alarmed {
   my ( $eid, $mid ) = @_;
-  my $db = _settings()->{db};
-  if ( !defined $event_start{$eid} ) {
-    # ZoneMinder writes the start in its own zone, which its connection has
-    my $rows = _rows( 'SELECT UNIX_TIMESTAMP(StartDateTime) AS t FROM Events WHERE Id = ?', $eid );
-    die "no event $eid\n" if !@$rows || !defined $rows->[0]{t};
-    $event_start{$eid} = $rows->[0]{t};
+  my $db   = _settings()->{db};
+  my $e    = _event( $eid, $mid );
+  my @bind = ( $mid, _utc6( $e->{start} - _settings()->{hold} ) );
+  my $sql =
+      "SELECT label, MAX(best_confidence) AS confidence,"
+    . " SUBSTRING_INDEX(GROUP_CONCAT(picture ORDER BY raised_at, first_seen SEPARATOR '\\n'), '\\n', 1) AS picture,"
+    . " GROUP_CONCAT(DISTINCT DATE_FORMAT(raised_at, '%Y-%m-%d %H:%i:%s.%f') ORDER BY raised_at SEPARATOR ',') AS alarms"
+    . " FROM `$db`.detector_alarms WHERE monitor_id = ? AND last_seen >= ?";
+  if ( defined $e->{next} ) {
+    $sql .= ' AND first_seen < ?';
+    push @bind, _utc6( $e->{next} );
   }
-  my $t    = $event_start{$eid};
-  my $s    = int($t);
-  my $from = strftime( '%Y-%m-%d %H:%M:%S', gmtime($s) ) . sprintf( '.%06d', int( ( $t - $s ) * 1e6 + 0.5 ) % 1000000 );
-  my $rows = _rows(
-    "SELECT label, MAX(best_confidence) AS confidence,"
-      . " SUBSTRING_INDEX(GROUP_CONCAT(picture ORDER BY raised_at, first_seen SEPARATOR '\\n'), '\\n', 1) AS picture"
-      . " FROM `$db`.detector_alarms"
-      . ' WHERE monitor_id = ? AND last_seen >= ? GROUP BY label',
-    $mid, $from
-  );
+  my $rows = _rows( "$sql GROUP BY label", @bind );
   my %found;
   foreach (@$rows) {
     ( my $label = lc( $_->{label} // '' ) ) =~ s/^\s+|\s+$//g;
     $label = 'motorcycle' if $label eq 'motorbike';
-    $found{$label} = { confidence => $_->{confidence}, picture => $_->{picture} } if $label ne '';
+    next if $label eq '';
+    my @alarms = split /,/, $_->{alarms} // '';
+    my @times  = grep {defined} map { _epoch($_) } @alarms;
+    $found{$label} = {
+      confidence => $_->{confidence},
+      picture    => $_->{picture},
+      alarms     => \@alarms,
+      inside     => ( @times && !grep { $_ <= $e->{start} + 1 } @times ) ? 1 : 0,
+      raised     => ( sort { $b <=> $a } @times )[0],
+    };
   }
   return \%found;
 }
 
+# Whether a type should wait before it's told: its newest alarm was raised
+# less than 3 s ago, once the event was at least the camera's
+# MinSectionLength old, and ZoneMinder hasn't opened the next event yet.
+# ZoneMinder opens a new event for an alarm that starts in an event that old,
+# a moment after it's raised; the type is that event's, not this one's.
+sub _waits {
+  my ( $eid, $mid, $type ) = @_;
+  my $e = _event( $eid, $mid );
+  return 0 if defined $e->{next} || !defined $type->{raised};
+  return 0 if $type->{raised} < $e->{start} + $e->{min_section} - 0.5;
+  return time() - $type->{raised} < 3 ? 1 : 0;
+}
+
 # What has joined the event's alarm since this was last asked: (its text, as
-# the hook's, its detections, with only those types, and the picture of the
-# first of them), or () when nothing new has. $told holds the types already told of in this event, and is kept
-# up to date. A failed read is logged once for the event, and tried again.
+# the hook's, its detections, with only those types and their alarms, and the
+# picture of the first of them), or () when nothing new has. $told holds, for
+# each type, the alarms already told of in this event, and is kept up to date:
+# a type is new in a new alarm of it. A failed read is logged once for the
+# event, and tried again.
 sub joined {
   my ( $eid, $mid, $told ) = @_;
   my $now = eval { alarmed( $eid, $mid ) };
@@ -264,14 +387,58 @@ sub joined {
     main::Error("Alert rules: what has alarmed in event $eid couldn't be read, trying again: $err") if !$told->{"\0failed"}++;
     return;
   }
-  my @new = sort { $now->{$b}{confidence} <=> $now->{$a}{confidence} || $a cmp $b } grep { !$told->{$_} } keys %$now;
+  my %fresh;
+  foreach my $l ( keys %$now ) {
+    next if ref( $told->{$l} ) eq 'HASH' && $told->{$l}{"\0any"};
+    my @ids = grep { !( ref( $told->{$l} ) eq 'HASH' && $told->{$l}{$_} ) } @{ $now->{$l}{alarms} };
+    $fresh{$l} = \@ids if @ids && !_waits( $eid, $mid, $now->{$l} );
+  }
+  my @new = sort { $now->{$b}{confidence} <=> $now->{$a}{confidence} || $a cmp $b } keys %fresh;
   return if !@new;
-  $told->{$_} = 1 for @new;
+  foreach my $l (@new) { $told->{$l}{$_} = 1 for @{ $fresh{$l} } }
   my @score = map { 0 + sprintf( '%.2f', $now->{$_}{confidence} ) } @new;
   my ($picture) = grep { defined && $_ ne '' } map { $now->{$_}{picture} } @new;
   my $text  = 'detected:' . join( ' ', map { "$new[$_]:" . sprintf( '%d%%', $score[$_] * 100 + 0.5 ) } 0 .. $#new );
   main::Info("Alert rules: $text joined the alarm of event $eid");
-  return ( $text, { labels => \@new, confidences => \@score, frame_id => 'alarm', source => 'live detection' }, $picture );
+  return ( $text,
+    { labels => \@new, confidences => \@score, alarms => { map { $_ => $fresh{$_} } @new }, frame_id => 'alarm', source => 'live detection' },
+    $picture );
+}
+
+# The event's alarm frames once ZoneMinder has closed it, or undef while it
+# hasn't (waited for up to $tries seconds).
+sub alarm_frames {
+  my ( $eid, $tries ) = @_;
+  for my $try ( 0 .. ( $tries // 5 ) ) {
+    my $rows = eval { _rows( 'SELECT AlarmFrames AS af, EndDateTime AS ended FROM Events WHERE Id = ?', $eid ) };
+    return $rows->[0]{af} if $rows && @$rows && defined $rows->[0]{ended};
+    sleep(1) if $try < ( $tries // 5 );
+  }
+  return undef;
+}
+
+# An event that ended with no alarm frames had no alarm: the tags, the notes'
+# texts and the picture it was given come off.
+sub untell {
+  my ( $eid, $labels, $texts ) = @_;
+  my $ok = eval {
+    foreach my $l (@$labels) {
+      _do( 'DELETE et FROM Events_Tags et JOIN Tags t ON t.Id = et.TagId WHERE et.EventId = ? AND t.Name = ?', $eid, $l );
+    }
+    foreach my $t (@$texts) {
+      _do( 'UPDATE Events SET Notes = TRIM(REPLACE(Notes, ?, \'\')) WHERE Id = ?', "$t ", $eid );
+    }
+    my $path = eval { _event_path($eid) };
+    unlink("$path/objdetect.jpg") if $path && -e "$path/objdetect.jpg";
+    1;
+  };
+  if ( !$ok ) {
+    ( my $err = $@ // '' ) =~ s/\s+$//;
+    main::Error("Alert rules: event $eid had no alarm, but what it was given couldn't all be taken off: $err");
+    return 0;
+  }
+  main::Info( "Alert rules: event $eid had no alarm; its " . join( ', ', @$labels ) . ' taken off' ) if @$labels;
+  return 1;
 }
 
 # The event's folder, from ZoneMinder (a sub of its own so tests can stand in).
@@ -305,6 +472,18 @@ sub picture_to_event {
     return 0;
   }
   return $ok;
+}
+
+# The start's types and their alarms, as told of: into $told (see joined).
+sub told_at_start {
+  my ( $start, $told ) = @_;
+  my $det = $start->{DetectionJson};
+  foreach my $l ( labels($start) ) {
+    my $a = ref($det) eq 'HASH' && ref( $det->{alarms} ) eq 'HASH' ? $det->{alarms}{$l} : undef;
+    my @ids = ref($a) eq 'ARRAY' ? @$a : defined $a ? ($a) : ();
+    $told->{$l}{$_} = 1 for @ids;
+    $told->{$l}{"\0any"} = 1 if !@ids;    # a start without alarms (not ours): the type as a whole
+  }
 }
 
 sub _hash { return sha256_hex( Encode::encode_utf8( $_[0] ) ); }
