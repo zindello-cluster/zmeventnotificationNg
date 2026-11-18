@@ -161,6 +161,7 @@ sub sendEvent {
     return unless _claimSend( $ac, $alarm->{MonitorId}, $mint );
   }
   $send->( $alarm, $ac, $event_type, $resCode );
+  return 1;    # zindello-cluster: sent (following an event counts each connection's one push)
 }
 
 # Last-sent times are shared through a file, not kept in active_connections:
@@ -476,6 +477,52 @@ sub hookLimitReached {
   return 0;
 }
 
+# zindello-cluster: alert rules, following the event (ALERT-RULES.md). A type
+# that has joined the event's alarm since the start is sent at once, alone,
+# through sendEvent and so through the rules, to each connection the start
+# would go to that hasn't had this event's push yet: one push per event for
+# each phone, raised by the first type its user has switched on. Its text goes
+# before the event's notes and it's tagged, as the start hook's are. Its frame
+# becomes the event's picture if the event has none, or if this is the
+# event's first push and the picture there is of a type nobody was sent.
+sub _sendJoined {
+  my ( $alarm, $mname, $mid, $eid, $told, $first_cause, $pushed ) = @_;
+  my ( $text, $det, $picture ) = ZmEventNotification::AlertRules::joined( $eid, $mid, $told );
+  return if !$text;
+  my $json = encode_json($det);
+  print main::WRITER 'event_description--TYPE--' . $mid . '--SPLIT--' . $eid . '--SPLIT--' . $text . "\n";
+  _tag_detected_objects( $eid, $json, 'event_joined' );
+
+  my ( $rulesAllowed, $rulesObject ) = isAllowedInRules($alarm);
+  if ( !$rulesAllowed ) {
+    main::Debug( 1, 'rules: Not sending what joined the alarm as rules checks failed' );
+    return;
+  }
+  my $joined = _build_alarm_obj( $mname, $mid, $eid, $text . ' ' . ( $first_cause // '' ), $det, $rulesObject );
+  my $first_push = !%$pushed;
+  my $sent = 0;
+  my %fcm_token_duplicates = ();
+  foreach (@main::active_connections) {
+    next if $_->{token} && $fcm_token_duplicates{ $_->{token} };
+    next if $pushed->{ _connKey($_) };
+    if ( shouldSendEventToConn( $joined, $_ ) ) {
+      if ( sendEvent( $joined, $_, 'event_start', 0 ) ) {
+        $pushed->{ _connKey($_) } = 1;
+        $sent++;
+      }
+      $fcm_token_duplicates{ $_->{token} }++ if $_->{token};
+    }
+  }
+  ZmEventNotification::AlertRules::picture_to_event( $eid, $picture, $sent && $first_push );
+  return;
+}
+
+# zindello-cluster: a connection, as the one push per event counts it.
+sub _connKey {
+  my $ac = shift;
+  return ( $ac->{token} // '' ) ne '' ? "token\0$ac->{token}" : 'id\0' . ( $ac->{id} // '' );
+}
+
 sub processNewAlarmsInFork {
   my $newEvent       = shift;
   my $alarm          = $newEvent->{Alarm};
@@ -491,6 +538,11 @@ sub processNewAlarmsInFork {
 
   my $endProcessed = 0;
   my %skip_hooks = map { $_ => 1 } split(',', $hooks_config{hook_skip_monitors} // '');
+
+  # zindello-cluster: alert rules, following the event (ALERT-RULES.md)
+  my %told;
+  my %pushed;    # the connections this event's push has gone to
+  my $first_cause = $alarm->{Start}->{Cause};
 
   my $start_time = time();
 
@@ -566,6 +618,9 @@ sub processNewAlarmsInFork {
       }
     } elsif ( $alarm->{Start}->{State} eq 'ready' ) {
 
+      # zindello-cluster: the types told of at the start aren't told again
+      $told{$_} = 1 for ZmEventNotification::AlertRules::labels( $alarm->{Start} );
+
       my ( $rulesAllowed, $rulesObject ) = isAllowedInRules($alarm);
       if ( !$rulesAllowed ) {
         main::Debug(1, 'rules: Not processing start notifications as rules checks failed');
@@ -585,7 +640,8 @@ sub processNewAlarmsInFork {
           }
           if ( shouldSendEventToConn( $temp_alarm_obj, $_ ) ) {
             main::Debug(1, 'token is unique, shouldSendEventToConn returned true, so calling sendEvent');
-            sendEvent( $temp_alarm_obj, $_, 'event_start', $hookResult );
+            # zindello-cluster: counted, so following the event sends it no more
+            $pushed{ _connKey($_) } = 1 if sendEvent( $temp_alarm_obj, $_, 'event_start', $hookResult );
             $fcm_token_duplicates{$_->{token}}++ if $_->{token};
           }
         }
@@ -724,6 +780,11 @@ sub processNewAlarmsInFork {
       $doneProcessing = 1;
     }
 
+    # zindello-cluster: alert rules, following the event (ALERT-RULES.md)
+    if ( $alarm->{Start}->{State} eq 'done' && !$endProcessed && ZmEventNotification::AlertRules::following() ) {
+      _sendJoined( $alarm, $mname, $mid, $eid, \%told, $first_cause, \%pushed );
+    }
+
     if ( !main::zmMemVerify($monitor) ) {
       main::Error('SHM failed, re-validating it');
       if (!main::loadMonitor($monitor)) {
@@ -752,7 +813,7 @@ sub processNewAlarmsInFork {
             . $alarm->{End}->{Cause});
       }
     }
-    sleep(2);
+    sleep( ZmEventNotification::AlertRules::following() ? ZmEventNotification::AlertRules::follow_seconds() : 2 );
   } # end while loop
 
   main::Debug(1, 'exiting');

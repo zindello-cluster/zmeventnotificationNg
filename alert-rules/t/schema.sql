@@ -28,3 +28,19 @@ CREATE TABLE IF NOT EXISTS alert_phones (
   last_push    DATETIME NULL,
   remove       BOOLEAN NOT NULL DEFAULT FALSE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Live detection's record of what raised or held each alarm: a copy of the chart's
+-- (external-security.zindello.com.au, deploy/live/schema.sql, detector_alarms), which following
+-- an event reads. Keep the two the same.
+CREATE TABLE IF NOT EXISTS detector_alarms (
+  monitor_id       INT UNSIGNED NOT NULL,
+  raised_at        DATETIME(6) NOT NULL,
+  label            VARCHAR(32) NOT NULL,
+  first_seen       DATETIME(6) NOT NULL,
+  last_seen        DATETIME(6) NOT NULL,
+  best_confidence  DECIMAL(3,2) NOT NULL,
+  raised           BOOLEAN NOT NULL,
+  picture          VARCHAR(128) NULL,
+  PRIMARY KEY (monitor_id, raised_at, label),
+  KEY by_last_seen (monitor_id, last_seen)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
