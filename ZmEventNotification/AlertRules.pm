@@ -44,8 +44,9 @@ package ZmEventNotification::AlertRules;
 #     while its alarm is on, so a second alarm in the same event is seen;
 #   - an event's types are those whose alarm was on during it (their last
 #     sighting, plus hold_seconds, at or after its start, and their first
-#     before the next event's start); an alarm raised inside a continuous
-#     section waits up to 3 s for the alarmed event ZoneMinder opens for it;
+#     before the next event's start); an alarm raised once the event is at
+#     least MinSectionLength old waits up to 3 s for the event ZoneMinder
+#     opens for it;
 #   - an event that ends with no alarm frames loses the tags, notes and
 #     picture given to it.
 #
@@ -299,7 +300,8 @@ sub _event {
   if ( !$e ) {
     my $rows = _rows( 'SELECT UNIX_TIMESTAMP(StartDateTime) AS t, Cause AS cause FROM Events WHERE Id = ?', $eid );
     die "no event $eid\n" if !@$rows || !defined $rows->[0]{t};
-    $e = $event_start{$eid} = { start => $rows->[0]{t}, cause => $rows->[0]{cause} // '' };
+    my $msl = eval { _rows( 'SELECT MinSectionLength AS l FROM Monitors WHERE Id = ?', $mid )->[0]{l} };
+    $e = $event_start{$eid} = { start => $rows->[0]{t}, cause => $rows->[0]{cause} // '', min_section => $msl // 10 };
   }
   if ( !defined $e->{next} ) {
     my $rows = _rows( 'SELECT UNIX_TIMESTAMP(StartDateTime) AS t FROM Events WHERE MonitorId = ? AND Id > ? ORDER BY Id LIMIT 1', $mid, $eid );
@@ -358,15 +360,17 @@ sub alarmed {
   return \%found;
 }
 
-# Whether a type should wait before it's told: every alarm of it was raised
-# inside a continuous section, less than 3 s ago, and ZoneMinder hasn't opened
-# the next event yet. ZoneMinder opens an alarmed event for a new alarm a
-# moment after it's raised; the type is that event's, not this one's.
+# Whether a type should wait before it's told: its newest alarm was raised
+# less than 3 s ago, once the event was at least the camera's
+# MinSectionLength old, and ZoneMinder hasn't opened the next event yet.
+# ZoneMinder opens a new event for an alarm that starts in an event that old,
+# a moment after it's raised; the type is that event's, not this one's.
 sub _waits {
   my ( $eid, $mid, $type ) = @_;
   my $e = _event( $eid, $mid );
-  return 0 if defined $e->{next} || $e->{cause} ne 'Continuous' || !$type->{inside};
-  return time() - ( $type->{raised} // 0 ) < 3 ? 1 : 0;
+  return 0 if defined $e->{next} || !defined $type->{raised};
+  return 0 if $type->{raised} < $e->{start} + $e->{min_section} - 0.5;
+  return time() - $type->{raised} < 3 ? 1 : 0;
 }
 
 # What has joined the event's alarm since this was last asked: (its text, as

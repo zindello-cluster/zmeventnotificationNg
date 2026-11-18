@@ -173,7 +173,7 @@ sub who { return [ sort map { $_->[0] } @_ ] }
 subtest 'a type that joins the alarm is sent at once, alone, through the rules, to phones not yet told' => sub {
   config();
   $dbh->do("DELETE FROM `$ours`.detector_alarms");
-  my $raised = '2030-01-01 00:00:00';    # later than the event's start, so it's the event's
+  my $raised = '2020-01-01 00:00:00';    # later than the event's start, so it's the event's
   alarmed( 'car', 0.90, $raised, 'car.jpg' );
   open( my $p, '>', "$pictures/car.jpg" ) or die $!;
   print $p 'the car frame';
@@ -187,7 +187,7 @@ subtest 'a type that joins the alarm is sent at once, alone, through the rules, 
     100, 8,
     2 => sub { alarmed( 'person', 0.72, $raised, 'person.jpg' ) },
     3 => sub { alarmed( 'car', 0.95, $raised ) },              # seen again: already told
-    5 => sub { alarmed( 'truck', 0.66, '2030-01-01 00:00:09', 'truck.jpg' ) },
+    5 => sub { alarmed( 'truck', 0.66, '2020-01-01 00:00:09', 'truck.jpg' ) },
   );
   my @start  = grep { $_->[1] =~ /^detected:car/ } @sent;
   my @person = grep { $_->[1] =~ /^detected:person/ } @sent;
@@ -210,7 +210,7 @@ subtest 'nothing at the start: the first type to alarm is sent, and its frame is
   $dbh->do("DELETE FROM `$ours`.detector_alarms");
   local $ENV{TEST_HOOK_OUT}  = '';
   local $ENV{TEST_HOOK_EXIT} = 1;
-  run_event( 101, 4, 1 => sub { alarmed( 'person', 0.81, '2030-01-01 00:00:00', 'person.jpg' ) } );
+  run_event( 101, 4, 1 => sub { alarmed( 'person', 0.81, '2020-01-01 00:00:00', 'person.jpg' ) } );
   is_deeply( who(@sent), [ 'alice', 'bob' ], 'the person: alice and bob' );
   ok( -e "$events/101/objdetect.jpg", 'the event has its picture' );
 };
@@ -224,7 +224,7 @@ subtest 'the first push\'s frame replaces a picture of a type nobody was sent' =
   close($p);
   local $ENV{TEST_HOOK_OUT}  = '';
   local $ENV{TEST_HOOK_EXIT} = 1;
-  run_event( 102, 3, 1 => sub { alarmed( 'person', 0.81, '2030-01-01 00:00:00', 'person.jpg' ) } );
+  run_event( 102, 3, 1 => sub { alarmed( 'person', 0.81, '2020-01-01 00:00:00', 'person.jpg' ) } );
   open( my $o, '<', "$events/102/objdetect.jpg" ) or die $!;
   is( scalar(<$o>), 'the person frame', 'the person, who raised the event\'s first push' );
   close($o);
@@ -239,7 +239,7 @@ subtest 'an event whose start was sent keeps its picture' => sub {
   close($p);
   local $ENV{TEST_HOOK_OUT}  = 'detected:car:90%--SPLIT--{"labels":["car"]}';
   local $ENV{TEST_HOOK_EXIT} = 0;
-  run_event( 106, 3, 1 => sub { alarmed( 'person', 0.81, '2030-01-01 00:00:00', 'person.jpg' ) } );
+  run_event( 106, 3, 1 => sub { alarmed( 'person', 0.81, '2020-01-01 00:00:00', 'person.jpg' ) } );
   is_deeply( [ map { $_->[0] } @sent ], [ 'bob', 'alice' ], 'bob at the start, alice when the person joins' );
   open( my $o, '<', "$events/106/objdetect.jpg" ) or die $!;
   is( scalar(<$o>), 'the car frame, from the start', 'unchanged: the start was the event\'s first push' );
@@ -253,9 +253,9 @@ subtest 'one push per event for each phone, raised by the first type its user ha
   local $ENV{TEST_HOOK_EXIT} = 1;
   run_event(
     107, 6,
-    1 => sub { alarmed( 'car',    0.85, '2030-01-01 00:00:00' ) },
-    2 => sub { alarmed( 'person', 0.81, '2030-01-01 00:00:00' ) },
-    3 => sub { alarmed( 'truck',  0.70, '2030-01-01 00:00:00' ) },
+    1 => sub { alarmed( 'car',    0.85, '2020-01-01 00:00:00' ) },
+    2 => sub { alarmed( 'person', 0.81, '2020-01-01 00:00:00' ) },
+    3 => sub { alarmed( 'truck',  0.70, '2020-01-01 00:00:00' ) },
   );
   is_deeply( [ map { [ $_->[0], $_->[2] ] } @sent ], [ [ 'bob', ['car'] ], [ 'alice', ['person'] ], [ 'carol', ['truck'] ] ],
     'bob for the car; alice for the person, and not bob again; carol for the truck' );
@@ -266,16 +266,16 @@ subtest 'one alarm, one push for each phone, though it runs on into the next eve
   $dbh->do("DELETE FROM `$ours`.detector_alarms");
   local $ENV{TEST_HOOK_OUT}  = '';
   local $ENV{TEST_HOOK_EXIT} = 1;
-  run_event( 120, 3, 1 => sub { alarmed( 'person', 0.81, '2030-01-02 00:00:00' ) } );
+  run_event( 120, 3, 1 => sub { alarmed( 'person', 0.81, '2020-01-02 00:00:00' ) } );
   is_deeply( who(@sent), [ 'alice', 'bob' ], 'the person: alice and bob' );
   # ZoneMinder's next event, the same alarm still on: its start hook answers with it
-  local $ENV{TEST_HOOK_OUT}  = 'detected:person:81%--SPLIT--{"labels":["person"],"alarms":{"person":["2030-01-02 00:00:00.000000"]}}';
+  local $ENV{TEST_HOOK_OUT}  = 'detected:person:81%--SPLIT--{"labels":["person"],"alarms":{"person":["2020-01-02 00:00:00.000000"]}}';
   local $ENV{TEST_HOOK_EXIT} = 0;
-  run_event( 121, 4, keep => 1, 2 => sub { alarmed( 'person', 0.81, '2030-01-02 00:00:00' ) } );
+  run_event( 121, 4, keep => 1, 2 => sub { alarmed( 'person', 0.81, '2020-01-02 00:00:00' ) } );
   is( scalar(@sent), 0, 'the next event: nobody told again of the same alarm' );
   ok( AlertRulesTest::logged( info => qr/no alert to alice's phone .*told of this alarm already/ ), 'and the log says why' );
   # A new alarm with a person in it, in that event: a new push
-  run_event( 122, 4, keep => 1, cause => 'Detected', 2 => sub { alarmed( 'person', 0.9, '2030-01-02 00:01:00' ) } );
+  run_event( 122, 4, keep => 1, cause => 'Detected', 2 => sub { alarmed( 'person', 0.9, '2020-01-02 00:01:00' ) } );
   is_deeply( who(@sent), [ 'alice', 'bob' ], 'a new alarm: told' );
 };
 
@@ -286,7 +286,7 @@ subtest 'an event goes on after its alarm ends: a second alarm in it is told' =>
   local $ENV{TEST_HOOK_EXIT} = 0;
   run_event( 130, 6,
     1 => sub { $main::state = main::STATE_TAPE() },    # the car's alarm over; ZoneMinder records on in the same event
-    3 => sub { alarmed( 'person', 0.88, '2030-01-03 00:00:00' ); $main::state = 4 } );
+    3 => sub { alarmed( 'person', 0.88, '2020-01-03 00:00:00' ); $main::state = 4 } );
   is_deeply( [ map { $_->[0] } @sent ], [ 'bob', 'alice' ], 'bob for the car; alice for the person, in the same event' );
 };
 
@@ -322,7 +322,7 @@ subtest 'an event that ends with alarm frames keeps them' => sub {
   is( $dbh->selectrow_array('SELECT COUNT(*) FROM Events_Tags WHERE EventId = 141'), 1, 'its tag kept' );
 };
 
-subtest 'an alarm raised in a continuous section is the alarmed event\'s that ZoneMinder opens for it' => sub {
+subtest 'an alarm raised in a section 10 s old is the event\'s that ZoneMinder opens for it' => sub {
   config();
   $dbh->do("DELETE FROM `$ours`.detector_alarms");
   $dbh->do('DELETE FROM Events WHERE Id = 151');
@@ -337,6 +337,16 @@ subtest 'an alarm raised in a continuous section is the alarmed event\'s that Zo
     } );
   is( scalar(@sent), 0, 'nothing told in the section: the alarm is the next event\'s' );
   is_deeply( \@tags, [], 'nor tagged' );
+};
+
+subtest 'an alarm raised in a younger section is that section\'s, at once' => sub {
+  config();
+  $dbh->do("DELETE FROM `$ours`.detector_alarms");
+  local $ENV{TEST_HOOK_OUT}  = '';
+  local $ENV{TEST_HOOK_EXIT} = 1;
+  run_event( 160, 3, cause => 'Continuous', ago => 3,
+    1 => sub { $dbh->do( "INSERT INTO `$ours`.detector_alarms VALUES (5, UTC_TIMESTAMP(6), 'person', UTC_TIMESTAMP(6), UTC_TIMESTAMP(6), 0.9, 1, NULL)" ) } );
+  is_deeply( who(@sent), [ 'alice', 'bob' ], 'told, without waiting: ZoneMinder keeps an event younger than 10 s' );
 };
 
 subtest 'an alarm over before the event started isn\'t the event\'s' => sub {
@@ -354,7 +364,7 @@ subtest 'not following: as before, one decision at the start' => sub {
   $dbh->do("DELETE FROM `$ours`.detector_alarms");
   local $ENV{TEST_HOOK_OUT}  = '';
   local $ENV{TEST_HOOK_EXIT} = 1;
-  run_event( 104, 3, 1 => sub { alarmed( 'person', 0.81, '2030-01-01 00:00:00' ) } );
+  run_event( 104, 3, 1 => sub { alarmed( 'person', 0.81, '2020-01-01 00:00:00' ) } );
   is( scalar(@sent), 0, 'the person that joined isn\'t sent' );
   ok( !ZmEventNotification::AlertRules::following(), 'following is off unless set' );
 };
