@@ -572,8 +572,14 @@ sub processJobs {
       }
     } elsif ( $read_avail > 0 ) {
       chomp( my $txt = sysreadline(READER) );
-      Debug(2, "RAW TEXT-->$txt");
       my ( $job, @fields ) = parse_job_line($txt);
+      if ( ( $job eq 'fcm_notification' || $job eq 'fcm_token_delete' )
+        && defined $fields[0] && length $fields[0] ) {
+        my $token  = $fields[0];
+        my $masked = '...' . substr( $token, -10 );
+        $txt =~ s/\Q$token\E/$masked/g;
+      }
+      Debug(2, "RAW TEXT-->$txt");
 
       if ( $job eq 'message' ) {
         my ( $id, $tmsg ) = @fields;
@@ -595,7 +601,8 @@ sub processJobs {
         my ( $token, $badge, $count, $at, $eid ) = @fields;
         # zindello-cluster: alert rules: when each phone was last sent an alert
         ZmEventNotification::AlertRules::pushed($token) if defined &ZmEventNotification::AlertRules::pushed;
-        Debug(2, "GOT JOB==> update badge to $badge, count to $count for: $token, at: $at");
+        Debug(2, "GOT JOB==> update badge to $badge, count to $count for: ..."
+            . substr( $token, -10 ) . ", at: $at");
         foreach (@active_connections) {
           next unless defined $_->{token};
           next if $_->{token} ne $token;
@@ -895,8 +902,8 @@ sub initSocketServer {
                 Debug(1, 'Invaliding websocket, but NOT Marking '
                     . $conn->ip()
                     . getConnFields($conn)
-                    . ' for deletion as token '
-                    . $_->{token}
+                    . ' for deletion as token ...'
+                    . substr( $_->{token}, -10 )
                     . " active\n");
                 $_->{state} = INVALID_CONNECTION;
               }
