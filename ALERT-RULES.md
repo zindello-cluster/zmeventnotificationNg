@@ -7,8 +7,8 @@ is where a push is decided, and upstream's keeps no user against a phone. Kept u
 the change (cluster-docs: `spec/layout.md`, O431, K89, `docs/runbooks/event-server-fork.md`; the
 design is `external-security.zindello.com.au`'s
 [`docs/alert-rules.md`](https://github.com/zindello-cluster/external-security.zindello.com.au/blob/main/docs/alert-rules.md)).
-It's a feature that could go upstream, so it's kept as small commits that a pull request could
-carry.
+It's never merged back upstream, and no pull request is offered to it (the owner, 25 November
+2026: "We'll never be merging back to upstream"; cluster-docs O720).
 
 ## Our commits
 
