@@ -40,8 +40,8 @@ jobs:
           {
             echo "Upstream released [$latest](https://github.com/$UPSTREAM/releases/tag/$latest); \`alert-rules\` is on $ours, the release the ZoneMinder image carries (\`alert-rules/ZONEMINDER_IMAGE\`)."
             echo
-            echo "1. Read its release notes. Does upstream now keep each phone against its user and decide pushes per user (ALERT-RULES.md)? Then the fork has done its job: retire it."
-            echo "2. Otherwise this waits for the ZoneMinder image: the event server's files must match the rest of what that image holds. When zindello-cluster/zoneminder moves to a team image with this release, sync \`master\`, run \`alert-rules/sync.sh $latest <that image by digest>\`, push \`upstream-$latest\` and open a pull request into \`alert-rules\` with the release notes, risks and rollback."
+            echo "1. Read its release notes. Does upstream now have a change functionally identical to one of ours (ALERT-RULES.md)? It's assessed on its merits, ours kept or upstream's taken, never taken in place of ours automatically (cluster-docs O723). The fork is retired only once upstream's is taken for everything it carries."
+            echo "2. Moving to it waits for the ZoneMinder image: the event server's files must match the rest of what that image holds. When zindello-cluster/zoneminder moves to a team image with this release, sync \`master\`, run \`alert-rules/sync.sh $latest <that image by digest>\`, push \`upstream-$latest\` and open a pull request into \`alert-rules\` with the release notes, risks and rollback."
             echo "3. Once that's merged and built, one pull request in external-security.zindello.com.au moves both digests, ZoneMinder's and the event server's, together."
           } > "$RUNNER_TEMP/body.md"
           gh issue create --title "$title" --body-file "$RUNNER_TEMP/body.md"

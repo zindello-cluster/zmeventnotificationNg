@@ -193,7 +193,7 @@ sub validateAuth {
     return 1 unless $auth_config{enabled};
 
     return 0 if ( $u eq '' || $p eq '' );
-    my $sql = 'SELECT `Password` FROM `Users` WHERE `Username`=?';
+    my $sql = 'SELECT `Password` FROM `Users` WHERE `Username`=? AND `Enabled`=1';
     my $sth = $main::dbh->prepare_cached($sql)
       or main::Fatal( "Can't prepare '$sql': " . $main::dbh->errstr() );
     my $res = $sth->execute($u)
@@ -368,12 +368,12 @@ sub processIncomingMessage {
             || ( $_->{conn} != $conn )
             )
           {
-            my $existing_token = substr( $_->{token}, -10 );
-            my $new_token = substr( $data->{token}, -10 );
+            my $existing_suffix = substr( $_->{token}, -10 );
+            my $new_suffix = substr( $data->{token}, -10 );
             my $existing_conn = $_->{conn} ? $_->{conn}->ip().':'.$_->{conn}->port() : 'undefined';
             my $new_conn = $conn ? $conn->ip().':'.$conn->port() : 'undefined';
 
-            main::Debug(2, "JOB: new token matched existing token: ($new_token <==> $existing_token) but connection did not ($new_conn <==> $existing_conn)");
+            main::Debug(2, "JOB: new token matched existing token: ($new_suffix <==> $existing_suffix) but connection did not ($new_conn <==> $existing_conn)");
             main::Debug(1, 'JOB: Duplicate token found: marking ...' . substr( $_->{token}, -10 ) . ' to be deleted');
 
             $_->{state} = PENDING_DELETE;
@@ -408,12 +408,12 @@ sub processIncomingMessage {
           && ( $_->{conn} == $conn )
           && ( $_->{token} ne $data->{token} ) )
         {
-          my $existing_token = substr( $_->{token}, -10 );
-          my $new_token = substr( $data->{token}, -10 );
+          my $existing_suffix = substr( $_->{token}, -10 );
+          my $new_suffix = substr( $data->{token}, -10 );
           my $existing_conn = $_->{conn} ? $_->{conn}->ip().':'.$_->{conn}->port() : 'undefined';
           my $new_conn = $conn ? $conn->ip().':'.$conn->port() : 'undefined';
 
-          main::Debug(2, "JOB: connection matched ($new_conn <==> $existing_conn) but token did not ($new_token <==> $existing_token). first registration?");
+          main::Debug(2, "JOB: connection matched ($new_conn <==> $existing_conn) but token did not ($new_suffix <==> $existing_suffix). first registration?");
 
           $_->{type}     = FCM;
           $_->{token}    = $data->{token};
@@ -448,6 +448,23 @@ sub processIncomingMessage {
   #-----------------------------------------------------------------------------------
   elsif ($json_string->{event} eq 'control') {
     if ( $data->{type} eq 'filter' ) {
+      # filter changes the connection's monitor list and writes the token
+      # file, so it needs a connection that has authenticated. version stays
+      # open: clients use it as a keepalive.
+      if ( $auth_config{enabled} ) {
+        my $obj = getObjectForConn($conn);
+        if ( !$obj || $obj->{state} != VALID_CONNECTION ) {
+          my $str = encode_json(
+            { event  => 'control',
+              type   => 'filter',
+              status => 'Fail',
+              reason => 'NOAUTH'
+            }
+          );
+          _safe_send($conn, $str);
+          return;
+        }
+      }
       if ( !exists( $data->{monlist} ) ) {
         my $str = encode_json(
           { event  => 'control',

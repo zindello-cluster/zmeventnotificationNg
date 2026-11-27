@@ -61,6 +61,7 @@ BEGIN {
 # Mock database for auth
 our $mock_db_password;
 our $mock_db_user_exists = 1;
+our $mock_db_user_enabled = 1;
 our $dbh;
 
 BEGIN {
@@ -78,7 +79,12 @@ BEGIN {
     sub execute { 1 }
     sub finish { 1 }
     sub fetchrow_hashref {
+        my $self = shift;
         return undef unless $main::mock_db_user_exists;
+        # Honour the SQL the code actually sends: a query that filters on
+        # Enabled = 1 must not see a disabled user's row.
+        return undef if !$main::mock_db_user_enabled
+            && $self->{sql} =~ /`Enabled`\s*=\s*1/i;
         return { Password => $main::mock_db_password };
     }
 }
@@ -95,6 +101,7 @@ sub reset_state {
     @load_esconfig_calls = ();
     @restart_es_calls = ();
     @main::active_connections = ();
+    $mock_db_user_enabled = 1;
     %main::monitors = (
         1 => { Id => 1, Name => 'Front' },
         2 => { Id => 2, Name => 'Back' },
@@ -178,6 +185,25 @@ subtest 'validateAuth - user not found' => sub {
 
     is(validateAuth('unknown', 'pass', 'normal'), 0, 'Returns 0 for unknown user');
     $mock_db_user_exists = 1;
+};
+
+subtest 'validateAuth - disabled user rejected' => sub {
+    reset_state();
+    local $auth_config{enabled} = 1;
+    local $mock_db_password = '$2a$10$abcdefghijklmnopqrstuv';
+
+    no warnings 'redefine';
+    local *main::try_use = sub { 1 };
+    # bcrypt returns the settings string when the password matches
+    local *Crypt::Eksblowfish::Bcrypt::bcrypt = sub { $_[1] };
+
+    $mock_db_user_enabled = 0;
+    is(validateAuth('disabled', 'correctpw', 'normal'), 0,
+        'disabled user refused with the correct password');
+
+    $mock_db_user_enabled = 1;
+    is(validateAuth('enabled', 'correctpw', 'normal'), 1,
+        'enabled user with the correct password accepted');
 };
 
 subtest 'validateAuth - escontrol category' => sub {
@@ -790,6 +816,45 @@ subtest 'processIncomingMessage - push commands need an authenticated connection
     is($response->{event}, 'push', 'push reply');
     is($response->{status}, 'Fail', 'rejected');
     is($response->{reason}, 'NOAUTH', 'reason NOAUTH');
+};
+
+subtest 'processIncomingMessage - control filter needs an authenticated connection when auth is on' => sub {
+    reset_state();
+    local $fcm_config{enabled} = 1;
+    local $auth_config{enabled} = 1;
+    my $mock_conn = MockConn->new('192.168.1.1', 12345);
+    @main::active_connections = (
+        { conn => $mock_conn, state => PENDING_AUTH, type => WEB, token => '',
+          monlist => '1', intlist => '0', platform => 'android', pushstate => 'enabled',
+          appversion => '2.0', invocations => { count => 0, at => 0 } },
+    );
+
+    processIncomingMessage($mock_conn, encode_json({ event => 'control',
+        data => { type => 'filter', monlist => '1,2', intlist => '0,0' } }));
+
+    my $response = decode_json($mock_conn->{sent}[0] // '{}');
+    is($response->{event}, 'control', 'control reply');
+    is($response->{status}, 'Fail', 'rejected');
+    is($response->{reason}, 'NOAUTH', 'reason NOAUTH');
+    is($main::active_connections[0]{monlist}, '1', 'monlist untouched');
+    is($main::active_connections[0]{intlist}, '0', 'intlist untouched');
+    is(scalar @save_fcm_tokens_calls, 0, 'no token written');
+
+    # version stays open before auth: clients use it as a keepalive
+    processIncomingMessage($mock_conn, encode_json({ event => 'control',
+        data => { type => 'version' } }));
+    my $version = decode_json($mock_conn->{sent}[1] // '{}');
+    is($version->{type}, 'version', 'version answered before auth');
+    is($version->{status}, 'Success', 'version reply is a success');
+
+    # an authenticated connection still applies the filter
+    $main::active_connections[0]{state} = VALID_CONNECTION;
+    processIncomingMessage($mock_conn, encode_json({ event => 'control',
+        data => { type => 'filter', monlist => '1,2', intlist => '0,0' } }));
+
+    is($main::active_connections[0]{monlist}, '1,2', 'valid connection monlist updated');
+    is($main::active_connections[0]{intlist}, '0,0', 'valid connection intlist updated');
+    is(scalar @save_fcm_tokens_calls, 1, 'valid connection token saved once');
 };
 
 # Behind a reverse proxy every client has the proxy's IP, and a new socket can
