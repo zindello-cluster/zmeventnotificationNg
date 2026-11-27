@@ -3,8 +3,9 @@
 This is [ZoneMinder/zmeventnotificationNg](https://github.com/ZoneMinder/zmeventnotificationNg)
 (GPL-2.0-or-later), forked for alert rules on security.zindello.com.au: a push goes to a phone
 only when its user has that camera, and a type found in the event, switched on. The event server
-is where a push is decided, and upstream's keeps no user against a phone. Kept until upstream has
-the change (cluster-docs: `spec/layout.md`, O431, K89, `docs/runbooks/event-server-fork.md`; the
+is where a push is decided, and upstream's keeps no user against a phone. A functionally identical
+change upstream would be assessed on its merits, not taken in place of ours automatically
+(cluster-docs O723; cluster-docs: `spec/layout.md`, O431, K89, `docs/runbooks/event-server-fork.md`; the
 design is `external-security.zindello.com.au`'s
 [`docs/alert-rules.md`](https://github.com/zindello-cluster/external-security.zindello.com.au/blob/main/docs/alert-rules.md)).
 It's never merged back upstream, and no pull request is offered to it (the owner, 25 November
@@ -81,7 +82,23 @@ a comment where it sits, so a new upstream release merges cleanly:
    ```
 
 `git log $(cat alert-rules/UPSTREAM_RELEASE)..alert-rules -- zmeventnotification.pl ZmEventNotification`
-lists them.
+lists them, with the backports below.
+
+## Backports
+
+Fixes from a newer upstream release, taken onto ours before the ZoneMinder image carries that
+release (cluster-docs O958, `docs/runbooks/event-server-fork.md`). Each is upstream's commit
+cherry-picked onto `alert-rules` (`git cherry-pick -x`), its message naming the upstream issue
+and pull request, adapted only where our commits or the older release need it. The branch stays
+on `UPSTREAM_RELEASE`, so the ZoneMinder image's copies are still checked against that release.
+They're dropped again when the fork moves to a release that has them: the merge brings
+upstream's own, and a conflict between the two is resolved as upstream's.
+
+| Upstream | What it fixes | In | Adapted |
+| --- | --- | --- | --- |
+| #83, PR #84 | A disabled ZoneMinder user can't sign in (`WebSocketHandler.pm`, `validateAuth`: `AND Enabled=1`) | v7.0.38 | No |
+| #85, PR #86 | A control `filter` message from a connection that hasn't signed in is refused, reason `NOAUTH` (`WebSocketHandler.pm`) | v7.0.38 | No |
+| #87, PR #88 and its follow-up | FCM tokens masked to their last ten characters in the logs (`FCM.pm`, `zmeventnotification.pl` `processJobs`, `Util.pm` `uniq`, `WebSocketHandler.pm`) | v7.0.38 | Upstream's `.ratchet-*` files left out (v7.0.34 has none); the `fcm_notification` job keeps our `AlertRules::pushed($token)`, with the whole token, above the masked log line (`alert-rules/t/07-pushed-masked.t`) |
 
 ## The branches
 
@@ -126,13 +143,16 @@ there moves it, and merging and syncing that is the deploy. The image is private
 
 1. Each morning the `upstream` workflow opens an issue when upstream has a release newer than
    `UPSTREAM_RELEASE`.
-2. Read its release notes. If upstream now has what our commits do, stop here and retire the fork
-   (below). Otherwise it waits for the ZoneMinder image.
+2. Read its release notes. If upstream now has a change functionally identical to one of our
+   commits, it's assessed on its merits, ours kept or upstream's taken, never taken in place of
+   ours automatically (cluster-docs O723). Otherwise it waits for the ZoneMinder image. A fix in
+   it that we need sooner is a backport (above).
 3. When `zindello-cluster/zoneminder` moves to a team image with a newer event server, sync
    `master` (the **Sync fork** button, or `gh repo sync zindello-cluster/zmeventnotificationNg -b master`).
 4. `alert-rules/sync.sh <release> <that image by digest>` merges the release into a new branch,
    `upstream-<release>`, keeps upstream's workflows out, and records the release and the image. A
    conflict in our files stops it, naming them.
+   Backports in the release come back as upstream's (above).
 5. Push it and open a pull request into `alert-rules` with the release notes, risks and
    rollback. CI checks, tests, builds and smoke-tests it; the owner merges it.
 6. The merge builds the image; then one pull request in the chart moves both digests, ZoneMinder's
@@ -140,6 +160,7 @@ there moves it, and merging and syncing that is the deploy. The image is private
 
 ## Retiring the fork
 
-When upstream's event server has the change, or ZoneMinder keeps each phone against its user
+When, assessed on its merits (cluster-docs O723), upstream's event server's change is taken for
+everything our commits do, or ZoneMinder keeps each phone against its user
 itself and the rules move there: take the event server's image and the step that lays it over out
 of `external-security.zindello.com.au`, archive this repo, and take its row out of the layout.
